@@ -55,6 +55,9 @@ htmlcov/
 
 # UV
 .venv/
-uv.lock
+.uv-cache/
 
 CLAUDE.md
+
+# Ruff
+.ruff*

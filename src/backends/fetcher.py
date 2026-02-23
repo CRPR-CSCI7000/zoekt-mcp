@@ -4,7 +4,7 @@ import re
 from typing import Dict, List, Optional, Set
 
 import requests
-from .content_fetcher_protocol import MAX_FILE_SIZE, ContentFetcherProtocol
+from .content_fetcher_protocol import MAX_FETCH_LINE_WINDOW, MAX_FILE_SIZE, ContentFetcherProtocol
 
 
 class ZoektContentFetcher(ContentFetcherProtocol):
@@ -15,42 +15,83 @@ class ZoektContentFetcher(ContentFetcherProtocol):
         repository = repository.replace("https://", "").replace("http://", "")
         return repository
 
-    def get_content(self, repository: str, path: str = "", depth: int = 2, ref: str = "HEAD") -> str:
-        """Get content from repository using Zoekt.
+    def fetch_content(
+        self, repository: str, path: str, start_line: int, end_line: int
+    ) -> str:
+        """Get file content from repository using Zoekt.
 
         Args:
             repository: Repository path (e.g., "github.com/example/project")
-            path: File or directory path (e.g., "src/main.py")
-            depth: Tree depth for directory listings
-            ref: Git reference (not used in Zoekt implementation)
+            path: File path (e.g., "src/main.py")
+            start_line: Starting line number (1-indexed)
+            end_line: Ending line number (1-indexed)
 
         Returns:
-            File content if path is a file, directory tree if path is a directory
+            File content string
+
+        Raises:
+            ValueError: If repository or file path does not exist or is a directory
+        """
+        repository = self._clean_repository_path(repository)
+
+        if not path or path == ".":
+            raise ValueError("Path must point to a file, not a directory. Use list_dir for directory listing.")
+
+        # If it ends with a slash, it's explicitly a directory
+        if path.endswith("/"):
+            raise ValueError("Path must point to a file. Provided path is a directory.")
+
+        if start_line <= 0 or end_line <= 0:
+            raise ValueError("start_line and end_line must be positive integers.")
+        if end_line < start_line:
+            raise ValueError("end_line must be greater than or equal to start_line.")
+
+        requested_span = end_line - start_line + 1
+        range_was_capped = requested_span > MAX_FETCH_LINE_WINDOW
+        effective_end_line = min(end_line, start_line + MAX_FETCH_LINE_WINDOW - 1)
+
+        file_content = self._fetch_file_content(repository, path, start_line, effective_end_line)
+        if file_content is not None:
+            if range_was_capped:
+                range_notice = (
+                    f"\n\n[LINE RANGE CAPPED: Requested {requested_span} lines. "
+                    f"Showing lines {start_line}-{effective_end_line} (max {MAX_FETCH_LINE_WINDOW} lines per call).]"
+                )
+                return f"{file_content}{range_notice}"
+            return file_content
+            
+        raise ValueError("File not found or unreadable.")
+
+    def list_dir(self, repository: str, path: str = "", depth: int = 2) -> str:
+        """Get directory structure from repository using Zoekt.
+
+        Args:
+            repository: Repository path (e.g., "github.com/example/project")
+            path: Directory path (e.g., "src/")
+            depth: Tree depth for directory listings
+
+        Returns:
+            Formatted directory tree string
 
         Raises:
             ValueError: If repository or path does not exist
         """
-
         repository = self._clean_repository_path(repository)
 
         # Handle empty path as root directory
         if not path:
             path = "."
 
-        if path != "." and not path.endswith("/"):
-            file_content = self._fetch_file_content(repository, path)
-            if file_content is not None:
-                return file_content
-
-        # If not a file or failed to fetch, show directory tree
         return self._get_directory_tree(repository, path, depth)
 
-    def _fetch_file_content(self, repo: str, file_path: str) -> Optional[str]:
+    def _fetch_file_content(self, repo: str, file_path: str, start_line: int | None = None, end_line: int | None = None) -> Optional[str]:
         """Fetch individual file content from Zoekt.
 
         Args:
             repo: Repository name
             file_path: Path to the file
+            start_line: Optional start line (1-indexed)
+            end_line: Optional end line (1-indexed)
 
         Returns:
             str: File content or None if error/not found
@@ -75,7 +116,18 @@ class ZoektContentFetcher(ContentFetcherProtocol):
                 lines.append(line_content)
 
             if lines:
-                content = "\n".join(lines)
+                total_lines = len(lines)
+                start_idx = max(0, start_line - 1) if start_line is not None and start_line > 0 else 0
+                end_idx = min(total_lines, end_line) if end_line is not None and end_line > 0 else total_lines
+                
+                # Edge case if start_line > total_lines
+                if start_idx >= total_lines:
+                    return ""
+                    
+                sliced_lines = lines[start_idx:end_idx]
+                content = "\n".join(sliced_lines)
+
+                line_info = f"Lines {start_idx + 1}-{end_idx} of {total_lines}." if start_line or end_line else ""
 
                 if len(content) > MAX_FILE_SIZE:
                     truncated_content = content[:MAX_FILE_SIZE]
@@ -83,14 +135,15 @@ class ZoektContentFetcher(ContentFetcherProtocol):
                     if last_newline > 0:
                         truncated_content = truncated_content[:last_newline]
 
-                    line_count = content.count("\n") + 1
-                    return (
-                        f"{truncated_content}\n\n"
-                        f"[FILE TRUNCATED: File too large ({len(content):,} chars, {line_count} lines). "
-                        f"Showing first {len(truncated_content):,} chars]"
+                    line_count = truncated_content.count("\n") + 1
+                    truncation_msg = (
+                        f"\n\n[FILE TRUNCATED: Content too large ({len(content):,} chars). "
+                        f"Showing first {line_count} lines ({len(truncated_content):,} chars). "
+                        f"Use start_line and end_line parameters to read the rest.]"
                     )
+                    return f"{truncated_content}{truncation_msg}"
 
-                return content
+                return content if not line_info else f"{content}\n\n[{line_info}]"
             return None
         except requests.exceptions.RequestException:
             return None

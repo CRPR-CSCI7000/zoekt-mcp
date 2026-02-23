@@ -11,12 +11,13 @@ class SearchClientProtocol(Protocol):
     these methods will satisfy the protocol.
     """
 
-    def search(self, query: str, num: int) -> dict:
+    def search(self, query: str, num: int, context_lines: int = 2) -> dict:
         """Execute a search query and return raw results.
 
         Args:
             query: The search query string
             num: Maximum number of results to return
+            context_lines: Number of surrounding context lines for matches (max 10)
 
         Returns:
             Raw search results as a dictionary
@@ -32,5 +33,17 @@ class SearchClientProtocol(Protocol):
 
         Returns:
             List of formatted results
+        """
+        ...
+        
+    def search_symbols(self, query: str, num: int) -> dict:
+        """Execute a symbol search query.
+
+        Args:
+            query: The symbol search query string
+            num: Maximum number of results to return
+
+        Returns:
+            Raw search results as a dictionary
         """
         ...
