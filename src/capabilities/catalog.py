@@ -1,12 +1,9 @@
-import re
 from pathlib import Path
 from typing import Any, Literal
 
 import yaml
 
 from .models import CapabilityDoc, CapabilityHit
-
-_TOKEN_RE = re.compile(r"[a-z0-9_]+")
 
 
 class CapabilityCatalog:
@@ -62,46 +59,11 @@ class CapabilityCatalog:
             "example": entry.get("example", ""),
         }
 
-    def search(self, query: str, limit: int = 8) -> list[CapabilityHit]:
-        normalized_limit = min(max(1, limit), 50)
-        query_tokens = self._tokenize(query)
-        query_lc = query.lower().strip()
-
-        scored_hits: list[tuple[float, CapabilityHit]] = []
-        for doc in self._docs.values():
-            score = self._score_doc(doc, query_tokens, query_lc)
-            if score <= 0:
-                continue
-            scored_hits.append((score, self._doc_to_hit(doc, self._hit_metadata.get(doc.id))))
-
-        scored_hits.sort(key=lambda item: item[0], reverse=True)
-        return [hit for _, hit in scored_hits[:normalized_limit]]
+    def list_capabilities(self) -> list[CapabilityHit]:
+        return [self._doc_to_hit(doc, self._hit_metadata.get(doc.id)) for doc in self._docs.values()]
 
     def read(self, capability_id: str) -> CapabilityDoc | None:
         return self._docs.get(capability_id)
-
-    def _score_doc(self, doc: CapabilityDoc, query_tokens: set[str], query_lc: str) -> float:
-        if not query_tokens and not query_lc:
-            return 1.0
-
-        corpus_parts = [doc.id, doc.kind, doc.description, " ".join(doc.constraints)]
-        for example in doc.examples:
-            corpus_parts.append(str(example))
-
-        corpus = " ".join(corpus_parts).lower()
-        doc_tokens = self._tokenize(corpus)
-
-        overlap = len(query_tokens.intersection(doc_tokens))
-        token_score = float(overlap)
-
-        exact_id_boost = 3.0 if query_lc and query_lc == doc.id.lower() else 0.0
-        partial_id_boost = 1.5 if query_lc and query_lc in doc.id.lower() else 0.0
-
-        return token_score + exact_id_boost + partial_id_boost
-
-    @staticmethod
-    def _tokenize(value: str) -> set[str]:
-        return {token for token in _TOKEN_RE.findall(value.lower()) if token}
 
     @staticmethod
     def _doc_to_hit(doc: CapabilityDoc, metadata: dict[str, Any] | None = None) -> CapabilityHit:

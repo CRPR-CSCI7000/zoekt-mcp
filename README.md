@@ -17,7 +17,7 @@ There is no separate executor service.
 
 The server exposes only these 4 tools:
 
-1. `search_capabilities(query: str, limit: int = 8)`
+1. `list_capabilities()`
 2. `read_capability(capability_id: str)`
 3. `run_workflow_cli(command: str, timeout_seconds: int = 30)`
 4. `run_custom_workflow_code(code: str, args: dict = {}, timeout_seconds: int = 30)`
@@ -35,7 +35,7 @@ Removed tools:
 
 ## Recommended Flow
 
-1. Call `search_capabilities` for the objective.
+1. Call `list_capabilities`.
 2. Call `read_capability` for selected ids.
 3. Prefer `run_workflow_cli` for known tasks.
 4. Use `run_custom_workflow_code` only when workflows do not fit.

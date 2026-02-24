@@ -315,11 +315,22 @@ class ExecutionRunner:
             return str(raw_value)
         if arg_type == "integer":
             try:
-                return int(raw_value)
+                value = int(raw_value)
             except (TypeError, ValueError) as exc:
                 raise ValueError(
                     f"args validation failure: invalid integer for `--{arg_name.replace('_', '-')}`: {raw_value!r}. {usage}"
                 ) from exc
+            minimum = ExecutionRunner._coerce_integer_bound(schema.get("minimum"))
+            if minimum is not None and value < minimum:
+                raise ValueError(
+                    f"args validation failure: `--{arg_name.replace('_', '-')}` must be >= {minimum}: {value!r}. {usage}"
+                )
+            maximum = ExecutionRunner._coerce_integer_bound(schema.get("maximum"))
+            if maximum is not None and value > maximum:
+                raise ValueError(
+                    f"args validation failure: `--{arg_name.replace('_', '-')}` must be <= {maximum}: {value!r}. {usage}"
+                )
+            return value
         if arg_type == "boolean":
             value = str(raw_value).strip().lower()
             if value in {"true", "1", "yes", "on"}:
@@ -332,6 +343,15 @@ class ExecutionRunner:
         raise ValueError(
             f"args validation failure: unsupported arg type `{arg_type}` for `--{arg_name.replace('_', '-')}`. {usage}"
         )
+
+    @staticmethod
+    def _coerce_integer_bound(value: Any) -> int | None:
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
 
     def _build_environment(self) -> dict[str, str]:
         env: dict[str, str] = {}

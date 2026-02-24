@@ -21,10 +21,6 @@ logger = logging.getLogger(__name__)
 
 load_dotenv()
 
-DEFAULT_CAPABILITY_LIMIT = 8
-MAX_CAPABILITY_LIMIT = 50
-
-
 class ZoektMCPServer:
     def __init__(self, config: ServerConfig) -> None:
         self.config = config
@@ -52,10 +48,10 @@ class ZoektMCPServer:
         prompt_path = pathlib.Path(__file__).parent / "prompts" / "prompts.yaml"
         prompt_manager = PromptManager(file_path=prompt_path)
 
-        self.search_capabilities_description = self._load_prompt_with_default(
+        self.list_capabilities_description = self._load_prompt_with_default(
             prompt_manager,
-            "tools.search_capabilities",
-            "Search available workflow/runtime execution capabilities.",
+            "tools.list_capabilities",
+            "List available workflow/runtime execution capabilities.",
         )
         self.read_capability_description = self._load_prompt_with_default(
             prompt_manager,
@@ -88,18 +84,17 @@ class ZoektMCPServer:
         logger.info("Received signal %s, initiating graceful shutdown...", sig)
         self._shutdown_requested = True
 
-    async def search_capabilities(self, query: str, limit: int = DEFAULT_CAPABILITY_LIMIT) -> str:
+    async def list_capabilities(self) -> str:
         if self._shutdown_requested:
-            logger.info("Shutdown in progress, declining new capability search requests")
-            return "## Capability Search\n\nServer is shutting down."
+            logger.info("Shutdown in progress, declining new capability list requests")
+            return "## Capability List\n\nServer is shutting down."
 
-        normalized_limit = min(max(1, limit), MAX_CAPABILITY_LIMIT)
         try:
-            hits = await asyncio.to_thread(self.capability_catalog.search, query, normalized_limit)
-            return self._format_capability_hits_markdown(query=query, hits=hits)
+            hits = await asyncio.to_thread(self.capability_catalog.list_capabilities)
+            return self._format_capability_list_markdown(hits=hits)
         except Exception as exc:
-            logger.error("search_capabilities failed: %s", exc)
-            return f"## Capability Search\n\nError: `{exc}`"
+            logger.error("list_capabilities failed: %s", exc)
+            return f"## Capability List\n\nError: `{exc}`"
 
     async def read_capability(self, capability_id: str) -> str:
         if self._shutdown_requested:
@@ -225,21 +220,12 @@ class ZoektMCPServer:
         )
 
     @staticmethod
-    def _format_capability_hits_markdown(query: str, hits: list[CapabilityHit]) -> str:
-        lines = ["## Capability Search Results", "", f"- Query: `{query}`", f"- Hits: `{len(hits)}`", ""]
+    def _format_capability_list_markdown(hits: list[CapabilityHit]) -> str:
+        lines = ["## Capability List", "", f"- Total: `{len(hits)}`", ""]
         lines.extend(ZoektMCPServer._capability_kind_legend())
         lines.append("")
         if not hits:
-            lines.extend(
-                [
-                    "No capabilities matched.",
-                    "",
-                    "Try a broader query:",
-                    "- Use 2-5 keywords, not a full sentence.",
-                    "- Start with intent words like `repo discovery`, `symbol definition`, `symbol usage`, or `file context`.",
-                    "- Drop stack traces, exact error text, and very specific literals.",
-                ]
-            )
+            lines.append("No capabilities available.")
             return "\n".join(lines)
 
         for index, hit in enumerate(hits, start=1):
@@ -346,7 +332,7 @@ class ZoektMCPServer:
 
     def _register_tools(self) -> None:
         tools = [
-            (self.search_capabilities, "search_capabilities", self.search_capabilities_description),
+            (self.list_capabilities, "list_capabilities", self.list_capabilities_description),
             (self.read_capability, "read_capability", self.read_capability_description),
             (self.run_workflow_cli, "run_workflow_cli", self.run_workflow_cli_description),
             (

@@ -65,7 +65,7 @@ workflows:
 
   - id: symbol_usage
     summary: Locate usages/call-sites of a symbol or API.
-    when_to_use: Use after definitions are known and you need references/usages.
+    when_to_use: Use after definitions are known and before reading file ranges directly.
     required_args:
       - query
     example: 'run_workflow_cli(command="symbol_usage --query ''ProcessOrder r:checkout''")'
@@ -87,14 +87,17 @@ workflows:
         type: integer
         required: false
         default: 2
+        minimum: 0
+        maximum: 2
         description: Context lines around each match.
     examples:
       - call: run_workflow_cli
         args:
-          command: symbol_usage --query "ProcessOrder -f:test lang:go" --limit 8 --context-lines 1
+          command: symbol_usage --query "ProcessOrder -f:test lang:go" --limit 8 --context-lines 2
     constraints:
       - For definitions use `symbol_definition` instead.
-      - Keep context lines low for compact output.
+      - Prefer this workflow to narrow targets before `file_context_reader`.
+      - "`context_lines` is hard-limited to 2."
     expected_output_shape:
       query: string
       results: list[object]
@@ -102,13 +105,13 @@ workflows:
 
   - id: file_context_reader
     summary: Read a bounded line window from a file.
-    when_to_use: Use when a specific file/line range is known and must be inspected.
+    when_to_use: Use as a final step when a specific file/line range is known from search workflows.
     required_args:
       - repo
       - path
       - start_line
       - end_line
-    example: 'run_workflow_cli(command="file_context_reader --repo github.com/org/repo --path src/app.py --start-line 1 --end-line 120")'
+    example: 'run_workflow_cli(command="file_context_reader --repo github.com/org/repo --path src/app.py --start-line 1 --end-line 60")'
     description: |
       Reads a specific line range from a file in a repository.
       Intended for focused code understanding after discovery phases.
@@ -125,18 +128,21 @@ workflows:
       start_line:
         type: integer
         required: true
+        minimum: 1
         description: 1-indexed start line.
       end_line:
         type: integer
         required: true
+        minimum: 1
         description: 1-indexed end line.
     examples:
       - call: run_workflow_cli
         args:
-          command: file_context_reader --repo github.com/org/payments --path src/service.py --start-line 40 --end-line 140
+          command: file_context_reader --repo github.com/org/payments --path src/service.py --start-line 40 --end-line 85
     constraints:
       - Requires a file path, not a directory.
-      - Keep ranges bounded.
+      - "Hard limit: requested window (`end_line - start_line + 1`) must be <= 60 lines."
+      - Prefer iterative narrow reads over broad file grabs.
     expected_output_shape:
       repo: string
       path: string
@@ -212,6 +218,7 @@ runtime_tools:
           context_lines: 1
     constraints:
       - Respect small limits and focused queries.
+      - "`context_lines` is hard-limited to 2."
     expected_output_shape:
       results: list[object]
 
@@ -247,7 +254,7 @@ runtime_tools:
       - path
       - start_line
       - end_line
-    example: 'runtime.zoekt_tools.fetch_content(repo="github.com/org/repo", path="src/main.go", start_line=1, end_line=120)'
+    example: 'runtime.zoekt_tools.fetch_content(repo="github.com/org/repo", path="src/main.go", start_line=1, end_line=60)'
     description: Fetch file content from Zoekt print endpoint.
     arg_schema:
       repo:
@@ -268,9 +275,10 @@ runtime_tools:
           repo: github.com/org/repo
           path: src/main.go
           start_line: 1
-          end_line: 120
+          end_line: 60
     constraints:
       - Requires a file path; directories are invalid.
+      - "Hard limit: requested window (`end_line - start_line + 1`) must be <= 60 lines."
     expected_output_shape:
       content: string
 

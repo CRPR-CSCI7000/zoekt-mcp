@@ -8,7 +8,8 @@ import requests
 DEFAULT_SEARCH_LIMIT = 10
 DEFAULT_CONTEXT_LINES = 2
 MAX_SEARCH_LIMIT = 25
-MAX_CONTEXT_LINES = 3
+MAX_CONTEXT_LINES = 2
+MAX_FETCH_WINDOW_LINES = 60
 
 
 class ZoektRuntimeError(RuntimeError):
@@ -23,11 +24,15 @@ class ZoektRuntime:
         self.base_url = configured_base_url.rstrip("/")
 
     def search(self, query: str, limit: int = DEFAULT_SEARCH_LIMIT, context_lines: int = DEFAULT_CONTEXT_LINES) -> list[dict[str, Any]]:
+        normalized_context_lines = int(context_lines)
+        if normalized_context_lines < 0 or normalized_context_lines > MAX_CONTEXT_LINES:
+            raise ZoektRuntimeError(f"context_lines must be between 0 and {MAX_CONTEXT_LINES}")
+
         params = {
             "q": query,
             "num": min(max(1, int(limit)), MAX_SEARCH_LIMIT),
             "format": "json",
-            "ctx": min(max(0, int(context_lines)), MAX_CONTEXT_LINES),
+            "ctx": normalized_context_lines,
         }
         response = requests.get(f"{self.base_url}/search", params=params, timeout=15)
         response.raise_for_status()
@@ -40,16 +45,29 @@ class ZoektRuntime:
         return self.search(query=query, limit=limit, context_lines=0)
 
     def fetch_content(self, repo: str, path: str, start_line: int, end_line: int) -> str:
+        if start_line <= 0 or end_line <= 0 or end_line < start_line:
+            raise ZoektRuntimeError("invalid line range")
+
+        requested_window = end_line - start_line + 1
+        if requested_window > MAX_FETCH_WINDOW_LINES:
+            raise ZoektRuntimeError(
+                f"line window too large: requested {requested_window} lines, max {MAX_FETCH_WINDOW_LINES}; narrow range and retry"
+            )
+
         params = {
             "r": _clean_repository_path(repo),
             "f": path,
         }
         response = requests.get(f"{self.base_url}/print", params=params, timeout=15)
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            body = _extract_error_body(response.text)
+            status_code = getattr(response, "status_code", "unknown")
+            if body:
+                raise ZoektRuntimeError(f"/print request failed with status {status_code}: {body}") from exc
+            raise ZoektRuntimeError(f"/print request failed with status {status_code}") from exc
         all_lines = _extract_lines_from_html(response.text)
-
-        if start_line <= 0 or end_line <= 0 or end_line < start_line:
-            raise ZoektRuntimeError("invalid line range")
 
         if not all_lines:
             raise ZoektRuntimeError("file not found or unreadable")
@@ -153,6 +171,15 @@ def _extract_lines_from_html(html_content: str) -> list[str]:
         lines.append(html.unescape(line_content))
 
     return lines
+
+
+def _extract_error_body(text: str, max_chars: int = 240) -> str:
+    body = text.strip()
+    if not body:
+        return ""
+    if len(body) <= max_chars:
+        return body
+    return body[:max_chars] + "..."
 
 
 def _format_search_results(payload: dict[str, Any], limit: int) -> list[dict[str, Any]]:

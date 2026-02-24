@@ -5,6 +5,7 @@ import json
 from runtime import zoekt_tools
 
 RESULT_MARKER = "__RESULT_JSON__="
+MAX_LINE_WINDOW = 60
 
 
 def parse_args(argv=None):
@@ -38,6 +39,11 @@ async def main():
             raise ValueError("start_line and end_line must be positive integers")
         if end_line < start_line:
             raise ValueError("end_line must be >= start_line")
+        requested_window = end_line - start_line + 1
+        if requested_window > MAX_LINE_WINDOW:
+            raise ValueError(
+                f"requested line window {requested_window} exceeds max {MAX_LINE_WINDOW}; narrow range and retry"
+            )
 
         content = await asyncio.to_thread(zoekt_tools.fetch_content, repo, path, start_line, end_line)
 

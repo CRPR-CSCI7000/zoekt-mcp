@@ -5,6 +5,7 @@ import json
 from runtime import zoekt_tools
 
 RESULT_MARKER = "__RESULT_JSON__="
+MAX_CONTEXT_LINES = 2
 
 
 def parse_args(argv=None):
@@ -30,6 +31,8 @@ async def main():
 
         limit = int(payload.get("limit", 10))
         context_lines = int(payload.get("context_lines", 2))
+        if context_lines < 0 or context_lines > MAX_CONTEXT_LINES:
+            raise ValueError(f"context_lines must be between 0 and {MAX_CONTEXT_LINES}")
         results = await asyncio.to_thread(zoekt_tools.search, query, limit, context_lines)
 
         output = {

@@ -20,6 +20,18 @@ def _ensure_mapping(raw: str) -> dict:
     return payload
 
 
+def _extract_ranked_repos(search_results: list[dict]) -> list[str]:
+    repos: list[str] = []
+    seen: set[str] = set()
+    for entry in search_results:
+        repo = str(entry.get("repository", "")).strip()
+        if not repo or repo in seen:
+            continue
+        repos.append(repo)
+        seen.add(repo)
+    return repos
+
+
 async def main():
     try:
         cli = parse_args()
@@ -32,9 +44,24 @@ async def main():
         max_repos = int(payload.get("max_repos", 8))
         definitions_limit = int(payload.get("definitions_limit", 2))
         usages_limit = int(payload.get("usages_limit", 3))
+        normalized_max_repos = max(1, max_repos)
 
-        repos = await asyncio.to_thread(zoekt_tools.list_repos)
-        selected_repos = repos[: max(1, max_repos)]
+        discovery_limit = max(normalized_max_repos * 3, 12)
+        repo_discovery_query = f"{symbol} type:repo"
+        discovery_results = await asyncio.to_thread(zoekt_tools.search, repo_discovery_query, discovery_limit, 0)
+        ranked_repos = _extract_ranked_repos(discovery_results)
+        selected_repos = ranked_repos[:normalized_max_repos]
+
+        if len(selected_repos) < normalized_max_repos:
+            all_repos = await asyncio.to_thread(zoekt_tools.list_repos)
+            selected_repo_set = set(selected_repos)
+            for repo in all_repos:
+                if repo in selected_repo_set:
+                    continue
+                selected_repos.append(repo)
+                selected_repo_set.add(repo)
+                if len(selected_repos) >= normalized_max_repos:
+                    break
 
         trace = []
         errors = []

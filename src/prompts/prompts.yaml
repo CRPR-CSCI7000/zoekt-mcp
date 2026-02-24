@@ -1,13 +1,12 @@
 tools:
-  search_capabilities: >
-    Search available capabilities by intent.
+  list_capabilities: >
+    List all available capabilities.
 
     Use this first. It returns compact hits across workflows, runtime helpers,
     and execution patterns.
 
     Parameters:
-    - query (required): intent, task, or keyword search text
-    - limit (optional): max hits to return (default 8)
+    - none
 
     Output format:
     - Markdown text (human-readable capability cards).
@@ -15,11 +14,11 @@ tools:
   read_capability: >
     Read the full capability document for one capability id.
 
-    Use this immediately after `search_capabilities` to confirm argument schema,
+    Use this immediately after `list_capabilities` to confirm argument schema,
     constraints, examples, and expected output shape before execution.
 
     Parameters:
-    - capability_id (required): capability id from `search_capabilities`
+    - capability_id (required): capability id from `list_capabilities`
 
     Output format:
     - Markdown text with JSON code fences for schema/examples/output shape.
@@ -28,6 +27,9 @@ tools:
     Execute a prebuilt workflow by CLI-style command.
 
     Prefer this path over generated scripts whenever a matching workflow exists.
+    For code understanding tasks, prefer `symbol_definition`/`symbol_usage` first,
+    then use `file_context_reader` only as a final, narrow follow-up.
+    Hard limits: search context lines must be <= 2; file windows must be <= 60 lines.
 
     Parameters:
     - command (required): CLI form `<workflow_id> [--flag value]...`
@@ -60,10 +62,11 @@ tools:
 guides:
   capability_first_flow: >
     Capability-first workflow:
-    1. Call `search_capabilities` with the objective.
+    1. Call `list_capabilities`.
     2. Call `read_capability` on the best candidate id(s).
-    3. Prefer `run_workflow_cli` whenever a prebuilt workflow matches.
-    4. Use `run_custom_workflow_code` only as fallback.
+    3. Use `run_workflow_cli` for `symbol_definition`/`symbol_usage` to narrow scope.
+    4. Use `file_context_reader` only after exact repo/path/line targets are known.
+    5. Use `run_custom_workflow_code` only as fallback.
 
     Execution marker convention:
     - Runner accepts marker output `__RESULT_JSON__=<json>` and also falls back to parsing plain JSON stdout.
