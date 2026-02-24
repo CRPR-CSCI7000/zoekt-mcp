@@ -1,141 +1,93 @@
 # Zoekt MCP Server
 
-A Model Context Protocol (MCP) server that provides code search capabilities powered by [Zoekt](https://github.com/sourcegraph/zoekt), the indexed code search engine used by Sourcegraph.
+`zoekt-mcp` is a Model Context Protocol (MCP) server that exposes a workflow-first interface for Zoekt-backed code intelligence.
 
-## Table of Contents
+## Architecture
 
-- [Overview](#overview)
-- [Features](#features)
-- [Prerequisites](#prerequisites)
-- [Installation](#installation)
-  - [Using UV (recommended)](#using-uv-recommended)
-  - [Using pip](#using-pip)
-  - [Using Docker](#using-docker)
-- [Configuration](#configuration)
-  - [Required Environment Variables](#required-environment-variables)
-  - [Optional Environment Variables](#optional-environment-variables)
-- [Usage with AI Tools](#usage-with-ai-tools)
-  - [Cursor](#cursor)
-- [MCP Tools](#mcp-tools)
-  - [search](#search)
-  - [search_prompt_guide](#search_prompt_guide)
-  - [fetch_content](#fetch_content)
-- [Development](#development)
-  - [Linting and Formatting](#linting-and-formatting)
+Single service/process with embedded modules:
 
-## Overview
+- `capabilities/`: capability discovery and full capability docs
+- `execution/`: request/result models, AST safety checks, and isolated runner
+- `workflows/`: workflow manifest and prebuilt scripts
+- `runtime/zoekt_tools.py`: safe Python wrappers over Zoekt HTTP endpoints
 
-This MCP server integrates with Zoekt, a text search engine optimized for code repositories. Zoekt provides trigram-based indexing for searches across large codebases, making it suitable for AI assistants that need to find and understand code patterns.
+There is no separate executor service.
 
-## Features
+## MCP Tools (Breaking Change)
 
-- **Code Search**: Search across codebases using Zoekt's trigram indexing
-- **Advanced Query Language**: Support for regex patterns, file filters, language filters, and boolean operators
-- **Repository Discovery**: Find repositories by name and explore their structure
-- **Content Fetching**: Browse repository files and directories
-- **AI Integration**: Designed for LLM integration with guided search prompts
+The server exposes only these 4 tools:
 
-## Prerequisites
+1. `search_capabilities(query: str, limit: int = 8)`
+2. `read_capability(capability_id: str)`
+3. `run_workflow(workflow_id: str, args: dict, timeout_seconds: int = 30)`
+4. `execute_ephemeral_script(code: str, args: dict = {}, timeout_seconds: int = 30)`
 
-- **Zoekt Instance**: You need access to a running Zoekt search server. See the [Zoekt documentation](https://github.com/sourcegraph/zoekt#installation) for setup instructions.
-- **Python 3.10+**: Required for running the MCP server
-- **UV** (optional): Modern Python package manager for easier dependency management
+All tool responses are rendered as markdown text for agent readability.
 
-## Installation
+Removed tools:
 
-### Using UV (recommended)
+- `search`
+- `search_symbols`
+- `search_prompt_guide`
+- `fetch_content`
+- `list_dir`
+- `list_repos`
 
-```bash
-# Install dependencies
-uv sync
+## Recommended Flow
 
-# Run the server
-uv run python src/main.py
-```
+1. Call `search_capabilities` for the objective.
+2. Call `read_capability` for selected ids.
+3. Prefer `run_workflow` for known tasks.
+4. Use `execute_ephemeral_script` only when workflows do not fit.
 
-### Using pip
+## Ephemeral Script Constraints
 
-```bash
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+Generated scripts are AST-validated before execution:
 
-# Install package
-pip install -e .
+- Required entrypoint shape:
+  - `def parse_args(...)`
+  - `async def main()`
+  - `if __name__ == "__main__": ...`
+- Import allowlist centered on: `argparse`, `asyncio`, `json`, `sys`, and `runtime.zoekt_tools`
+- Banned imports include modules such as `os`, `subprocess`, `socket`, `ctypes`, `multiprocessing`, `pathlib`
+- Banned calls include `eval`, `exec`, `compile`, `open`, `__import__`, `input`
 
-# Run the server
-python src/main.py
-```
+## Execution Behavior
 
-### Using Docker
+- Every run executes in an isolated temp working directory.
+- Subprocess invocation uses `python -I -u`.
+- Environment is reduced to an allowlist.
+- Timeout and stdout/stderr caps are enforced.
+- Scripts can emit a final marker line:
+  - `__RESULT_JSON__=<json>`
+  - parsed into `ExecutionResult.result_json`
 
-```bash
-# Build the image
-docker build -t zoekt-mcp .
-
-# Run the container with default ports
-docker run -p 8000:8000 -p 8080:8080 \
-  -e ZOEKT_API_URL=http://your-zoekt-instance \
-  zoekt-mcp
-
-# Or run with custom ports
-docker run -p 9000:9000 -p 9080:9080 \
-  -e ZOEKT_API_URL=http://your-zoekt-instance \
-  -e MCP_SSE_PORT=9000 \
-  -e MCP_STREAMABLE_HTTP_PORT=9080 \
-  zoekt-mcp
-```
+This is process-level sandboxing, not container-grade isolation.
 
 ## Configuration
 
-### Required Environment Variables
+Required:
 
-- `ZOEKT_API_URL`: URL of your Zoekt search instance
+- `ZOEKT_API_URL`
 
-### Optional Environment Variables
+Optional:
 
-- `MCP_SSE_PORT`: SSE server port (default: 8000)
-- `MCP_STREAMABLE_HTTP_PORT`: HTTP server port (default: 8080)
+- `MCP_SSE_PORT` (default `8000`)
+- `MCP_STREAMABLE_HTTP_PORT` (default `8080`)
+- `EXECUTION_TIMEOUT_DEFAULT` (default `30`)
+- `EXECUTION_TIMEOUT_MAX` (default `120`)
+- `EXECUTION_STDOUT_MAX_BYTES` (default `32768`)
+- `EXECUTION_STDERR_MAX_BYTES` (default `32768`)
 
-## Usage with AI Tools
-
-### Cursor
-
-After running the MCP server, add the following to your `.cursor/mcp.json` file:
-
-```json
-{
-  "mcpServers": {
-    "zoekt": {
-      "url": "http://localhost:8080/zoekt/mcp/"
-    }
-   }
-}
-```
-
-## MCP Tools
-
-This server provides three powerful tools for AI assistants:
-
-### 🔍 search
-Search across indexed codebases using Zoekt's advanced query syntax with support for regex, language filters, and boolean operators.
-
-### 📖 search_prompt_guide
-Generate a context-aware guide for constructing effective search queries based on your specific objective.
-
-### 📂 fetch_content
-Retrieve file contents or explore directory structures from indexed repositories.
-
-
-## Development
-
-### Linting and Formatting
+## Local Dev
 
 ```bash
-# Check code style
-uv run ruff check src/
-
-# Format code
-uv run ruff format src/
+uv sync
+uv run python src/main.py
 ```
 
+Lint:
+
+```bash
+uv run ruff check src
+```

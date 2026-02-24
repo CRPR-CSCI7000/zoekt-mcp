@@ -1,29 +1,28 @@
 import asyncio
+import json
 import logging
 import pathlib
 import signal
-from typing import Any, List
+from typing import Any
 
-import requests
 from dotenv import load_dotenv
 from fastmcp import FastMCP
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
-from .backends import FormattedResult, ZoektClient, ZoektContentFetcher
+from .capabilities import CapabilityCatalog, CapabilityDoc, CapabilityHit
 from .config import ServerConfig
-from .core import PromptManager
-from .exceptions import ContentFetchError, SearchError, ServerShutdownError
+from .prompts import PromptManager
+from .execution import EphemeralRunRequest, ExecutionResult, ExecutionRunner, WorkflowRunRequest
+from .workflows import format_workflow_result_markdown
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 load_dotenv()
 
-DEFAULT_SEARCH_LIMIT = 10
-MAX_SEARCH_LIMIT = 25
-DEFAULT_CONTEXT_LINES = 2
-MAX_CONTEXT_LINES = 3
+DEFAULT_CAPABILITY_LIMIT = 8
+MAX_CAPABILITY_LIMIT = 50
 
 
 class ZoektMCPServer:
@@ -32,267 +31,327 @@ class ZoektMCPServer:
         self.server = FastMCP()
         self._shutdown_requested = False
 
-        self._setup_clients()
+        self._setup_runtime()
         self._load_prompts()
 
-    def _setup_clients(self) -> None:
-        self.search_client = ZoektClient(base_url=self.config.zoekt_api_url)
-        self.content_fetcher = ZoektContentFetcher(zoekt_url=self.config.zoekt_api_url)
-        logger.info("Using Zoekt backend")
+    def _setup_runtime(self) -> None:
+        self.src_root = pathlib.Path(__file__).parent
+        self.manifest_path = self.src_root / "workflows" / "manifest.yaml"
+
+        self.capability_catalog = CapabilityCatalog(self.manifest_path)
+        self.execution_runner = ExecutionRunner(
+            src_root=self.src_root,
+            manifest_path=self.manifest_path,
+            timeout_default=self.config.execution_timeout_default,
+            timeout_max=self.config.execution_timeout_max,
+            stdout_max_bytes=self.config.execution_stdout_max_bytes,
+            stderr_max_bytes=self.config.execution_stderr_max_bytes,
+        )
 
     def _load_prompts(self) -> None:
-        prompt_manager = PromptManager(file_path=pathlib.Path(__file__).parent / "prompts" / "prompts.yaml")
+        prompt_path = pathlib.Path(__file__).parent / "prompts" / "prompts.yaml"
+        prompt_manager = PromptManager(file_path=prompt_path)
 
-        self.codesearch_guide = prompt_manager._load_prompt("guides.codesearch_guide")
-        self.search_tool_description = prompt_manager._load_prompt("tools.search")
-        self.search_symbols_description = prompt_manager._load_prompt("tools.search_symbols")
-        self.search_prompt_guide_description = prompt_manager._load_prompt("tools.search_prompt_guide")
-        self.fetch_content_description = prompt_manager._load_prompt("tools.fetch_content")
-        self.list_dir_description = prompt_manager._load_prompt("tools.list_dir")
+        self.search_capabilities_description = self._load_prompt_with_default(
+            prompt_manager,
+            "tools.search_capabilities",
+            "Search available workflow/runtime execution capabilities.",
+        )
+        self.read_capability_description = self._load_prompt_with_default(
+            prompt_manager,
+            "tools.read_capability",
+            "Read the full capability document by id.",
+        )
+        self.run_workflow_description = self._load_prompt_with_default(
+            prompt_manager,
+            "tools.run_workflow",
+            "Run a prebuilt workflow by id.",
+        )
+        self.execute_ephemeral_script_description = self._load_prompt_with_default(
+            prompt_manager,
+            "tools.execute_ephemeral_script",
+            "Run an ephemeral script in an isolated subprocess with safety checks.",
+        )
 
+    @staticmethod
+    def _load_prompt_with_default(prompt_manager: PromptManager, key: str, default: str) -> str:
         try:
-            self.org_guide = prompt_manager._load_prompt("guides.org_guide")
+            prompt = prompt_manager._load_prompt(key)
+            if isinstance(prompt, str) and prompt.strip():
+                return prompt
         except Exception:
-            self.org_guide = ""
+            logger.warning("Prompt key missing, using fallback: %s", key)
+        return default
 
     def signal_handler(self, sig: int, frame: Any = None) -> None:
         """Handle termination signals for graceful shutdown."""
-        logger.info(f"Received signal {sig}, initiating graceful shutdown...")
+        logger.info("Received signal %s, initiating graceful shutdown...", sig)
         self._shutdown_requested = True
 
-    async def fetch_content(self, repo: str, path: str, start_line: int, end_line: int) -> str:
+    async def search_capabilities(self, query: str, limit: int = DEFAULT_CAPABILITY_LIMIT) -> str:
         if self._shutdown_requested:
-            logger.info("Shutdown in progress, declining new requests")
-            raise ServerShutdownError("Server is shutting down")
+            logger.info("Shutdown in progress, declining new capability search requests")
+            return "## Capability Search\n\nServer is shutting down."
+
+        normalized_limit = min(max(1, limit), MAX_CAPABILITY_LIMIT)
+        try:
+            hits = await asyncio.to_thread(self.capability_catalog.search, query, normalized_limit)
+            return self._format_capability_hits_markdown(query=query, hits=hits)
+        except Exception as exc:
+            logger.error("search_capabilities failed: %s", exc)
+            return f"## Capability Search\n\nError: `{exc}`"
+
+    async def read_capability(self, capability_id: str) -> str:
+        if self._shutdown_requested:
+            return self._format_capability_doc_markdown(
+                self._error_capability_doc(capability_id, "server is shutting down")
+            )
 
         try:
-            result = await asyncio.to_thread(self.content_fetcher.fetch_content, repo, path, start_line, end_line)
-            return result
-        except ValueError as e:
-            logger.warning(f"Error fetching content from {repo}: {str(e)}")
-            raise ContentFetchError(f"Invalid arguments: {str(e)}") from e
-        except Exception as e:
-            logger.error(f"Unexpected error fetching content: {e}")
-            raise ContentFetchError("Error fetching content") from e
+            capability = await asyncio.to_thread(self.capability_catalog.read, capability_id)
+            if capability is None:
+                capability = self._error_capability_doc(capability_id, f"unknown capability_id: {capability_id}")
+            return self._format_capability_doc_markdown(capability)
+        except Exception as exc:
+            logger.error("read_capability failed: %s", exc)
+            return self._format_capability_doc_markdown(
+                self._error_capability_doc(capability_id, f"runner internal exception: {exc}")
+            )
 
-    async def list_dir(self, repo: str, path: str = "", depth: int = 2) -> str:
-        if self._shutdown_requested:
-            logger.info("Shutdown in progress, declining new requests")
-            raise ServerShutdownError("Server is shutting down")
-
-        try:
-            result = await asyncio.to_thread(self.content_fetcher.list_dir, repo, path, depth)
-            return result
-        except ValueError as e:
-            logger.warning(f"Error listing directory from {repo}: {str(e)}")
-            raise ContentFetchError(f"Invalid arguments: {str(e)}") from e
-        except Exception as e:
-            logger.error(f"Unexpected error listing directory: {e}")
-            raise ContentFetchError("Error listing directory") from e
-
-    async def search(
+    async def run_workflow(
         self,
-        query: str,
-        limit: int = DEFAULT_SEARCH_LIMIT,
-        context_lines: int = DEFAULT_CONTEXT_LINES,
-    ) -> List[FormattedResult]:
+        workflow_id: str,
+        args: dict[str, Any],
+        timeout_seconds: int = 30,
+    ) -> str:
         if self._shutdown_requested:
-            logger.info("Shutdown in progress, declining new requests")
-            raise ServerShutdownError("Server is shutting down")
-
-        num_results = min(max(1, limit), MAX_SEARCH_LIMIT)
-        num_context_lines = min(max(0, context_lines), MAX_CONTEXT_LINES)
-        logger.info(f"Search query: {query}, limit: {num_results}, context_lines: {num_context_lines}")
+            return self._format_execution_result_markdown(
+                "Workflow Execution",
+                self._error_execution_result("server is shutting down"),
+            )
 
         try:
-            results = await asyncio.to_thread(self.search_client.search, query, num_results, num_context_lines)
-            formatted_results = await asyncio.to_thread(self.search_client.format_results, results, num_results)
-            return formatted_results
-        except requests.exceptions.HTTPError as exc:
-            logger.error(f"Search HTTP error: {exc}")
-            raise SearchError(f"HTTP error during search: {exc}") from exc
+            request = WorkflowRunRequest(
+                workflow_id=workflow_id,
+                args=args,
+                timeout_seconds=timeout_seconds,
+            )
         except Exception as exc:
-            logger.error(f"Unexpected error during search: {exc}")
-            raise SearchError(f"Unexpected error during search: {exc}") from exc
-
-    async def search_symbols(self, query: str, limit: int = DEFAULT_SEARCH_LIMIT) -> List[FormattedResult]:
-        if self._shutdown_requested:
-            logger.info("Shutdown in progress, declining new requests")
-            raise ServerShutdownError("Server is shutting down")
-
-        num_results = min(max(1, limit), MAX_SEARCH_LIMIT)
-        logger.info(f"Symbol search query: {query}, limit: {num_results}")
+            return self._format_execution_result_markdown(
+                "Workflow Execution",
+                self._error_execution_result(f"args validation failure: {exc}", exit_code=2),
+            )
 
         try:
-            results = await asyncio.to_thread(self.search_client.search_symbols, query, num_results)
-            formatted_results = await asyncio.to_thread(self.search_client.format_results, results, num_results)
-            return formatted_results
-        except requests.exceptions.HTTPError as exc:
-            logger.error(f"Symbol search HTTP error: {exc}")
-            raise SearchError(f"HTTP error during symbol search: {exc}") from exc
+            result = await self.execution_runner.run_workflow_script(
+                workflow_id=request.workflow_id,
+                args=request.args,
+                timeout_seconds=request.timeout_seconds,
+            )
+            return format_workflow_result_markdown(request.workflow_id, result)
         except Exception as exc:
-            logger.error(f"Unexpected error during symbol search: {exc}")
-            raise SearchError(f"Unexpected error during symbol search: {exc}") from exc
+            logger.exception("run_workflow internal exception")
+            return format_workflow_result_markdown(
+                request.workflow_id,
+                self._error_execution_result(f"runner internal exception: {exc}"),
+            )
 
-    async def list_repos(self) -> List[str]:
+    async def execute_ephemeral_script(
+        self,
+        code: str,
+        args: dict[str, Any] | None = None,
+        timeout_seconds: int = 30,
+    ) -> str:
         if self._shutdown_requested:
-            logger.info("Shutdown in progress, declining new requests")
-            raise ServerShutdownError("Server is shutting down")
+            return self._format_execution_result_markdown(
+                "Ephemeral Script Execution",
+                self._error_execution_result("server is shutting down"),
+            )
 
         try:
-            url = f"{self.config.zoekt_api_url}/api/list"
-            response = await asyncio.to_thread(requests.post, url, json={})
-            response.raise_for_status()
-            data = response.json()
-            repos = []
-            if data and "List" in data and "Repos" in data["List"] and data["List"]["Repos"]:
-                for repo_obj in data["List"]["Repos"]:
-                    repo_info = repo_obj.get("Repository")
-                    if repo_info and repo_info.get("Name"):
-                        repos.append(repo_info["Name"])
-            return sorted(list(set(repos)))
+            request = EphemeralRunRequest(
+                code=code,
+                args=args or {},
+                timeout_seconds=timeout_seconds,
+            )
         except Exception as exc:
-            logger.error(f"Unexpected error during list_repos: {exc}")
-            return []
+            return self._format_execution_result_markdown(
+                "Ephemeral Script Execution",
+                self._error_execution_result(f"args validation failure: {exc}", exit_code=2),
+            )
 
-    async def search_prompt_guide(self, objective: str) -> str:
-        if self._shutdown_requested:
-            logger.info("Shutdown in progress, declining new prompt guide requests")
-            raise ServerShutdownError("Server is shutting down")
+        try:
+            result = await self.execution_runner.run_ephemeral_script(
+                code=request.code,
+                args=request.args,
+                timeout_seconds=request.timeout_seconds,
+            )
+            return self._format_execution_result_markdown("Ephemeral Script Execution", result)
+        except Exception as exc:
+            logger.exception("execute_ephemeral_script internal exception")
+            return self._format_execution_result_markdown(
+                "Ephemeral Script Execution",
+                self._error_execution_result(f"runner internal exception: {exc}"),
+            )
 
-        prompt_parts = []
-
-        if self.org_guide:
-            prompt_parts.append(self.org_guide)
-            prompt_parts.append("\n\n")
-
-        prompt_parts.append(self.codesearch_guide)
-        prompt_parts.append(
-            f"\nGiven this guide create a Zoekt query for {objective} and call the search tool accordingly."
+    @staticmethod
+    def _error_capability_doc(capability_id: str, message: str) -> CapabilityDoc:
+        return CapabilityDoc(
+            id=capability_id,
+            kind="error",
+            description=message,
+            arg_schema={},
+            examples=[],
+            constraints=[],
+            expected_output_shape={"error": "string"},
         )
 
-        return "".join(prompt_parts)
+    @staticmethod
+    def _error_execution_result(
+        message: str,
+        exit_code: int = 70,
+        safety_rejections: list[str] | None = None,
+    ) -> ExecutionResult:
+        return ExecutionResult(
+            success=False,
+            exit_code=exit_code,
+            stdout="",
+            stderr=message,
+            result_json=None,
+            timing_ms=0,
+            safety_rejections=safety_rejections or [],
+        )
 
-    async def _safe_fetch_content(self, repo: str, path: str, start_line: int, end_line: int) -> str:
-        """Safe wrapper for fetch_content that handles exceptions."""
-        try:
-            return await self.fetch_content(repo, path, start_line, end_line)
-        except ServerShutdownError:
-            return ""
-        except ContentFetchError as e:
-            return str(e)
-        except Exception as e:
-            logger.error(f"Unexpected error in fetch_content: {e}")
-            return "error fetching content"
+    @staticmethod
+    def _format_capability_hits_markdown(query: str, hits: list[CapabilityHit]) -> str:
+        lines = ["## Capability Search Results", "", f"- Query: `{query}`", f"- Hits: `{len(hits)}`", ""]
+        if not hits:
+            lines.append("No capabilities matched.")
+            return "\n".join(lines)
 
-    async def _safe_list_dir(self, repo: str, path: str = "", depth: int = 2) -> str:
-        """Safe wrapper for list_dir that handles exceptions."""
-        try:
-            return await self.list_dir(repo, path, depth)
-        except ServerShutdownError:
-            return ""
-        except ContentFetchError as e:
-            return str(e)
-        except Exception as e:
-            logger.error(f"Unexpected error in list_dir: {e}")
-            return "error listing directory"
+        for index, hit in enumerate(hits, start=1):
+            required_args = ", ".join(hit.required_args) if hit.required_args else "(none)"
+            lines.extend(
+                [
+                    f"### {index}. `{hit.id}`",
+                    f"- Kind: `{hit.kind}`",
+                    f"- Summary: {hit.summary}",
+                    f"- When to use: {hit.when_to_use}",
+                    f"- Required args: `{required_args}`",
+                    f"- Example: `{hit.example}`" if hit.example else "- Example: (none)",
+                    "",
+                ]
+            )
+        return "\n".join(lines).rstrip()
 
-    async def _safe_search(
-        self,
-        query: str,
-        limit: int = DEFAULT_SEARCH_LIMIT,
-        context_lines: int = DEFAULT_CONTEXT_LINES,
-    ) -> List[FormattedResult]:
-        """Safe wrapper for search that handles exceptions."""
-        try:
-            return await self.search(query, limit, context_lines)
-        except ServerShutdownError:
-            return []
-        except SearchError as e:
-            logger.error(f"Search error: {e}")
-            return []
-        except Exception as e:
-            logger.error(f"Unexpected error in search: {e}")
-            return []
+    @staticmethod
+    def _format_capability_doc_markdown(capability: CapabilityDoc) -> str:
+        lines = [f"## Capability: `{capability.id}`", "", f"- Kind: `{capability.kind}`", ""]
+        if capability.description:
+            lines.extend(["### Description", capability.description, ""])
 
-    async def _safe_search_symbols(self, query: str, limit: int = DEFAULT_SEARCH_LIMIT) -> List[FormattedResult]:
-        """Safe wrapper for symbol search that handles exceptions."""
-        try:
-            return await self.search_symbols(query, limit)
-        except ServerShutdownError:
-            return []
-        except SearchError as e:
-            logger.error(f"Symbol search error: {e}")
-            return []
-        except Exception as e:
-            logger.error(f"Unexpected error in symbol search: {e}")
-            return []
+        lines.extend(
+            [
+                "### Arg Schema",
+                "```json",
+                json.dumps(capability.arg_schema, indent=2, sort_keys=True, ensure_ascii=True),
+                "```",
+                "",
+                "### Examples",
+                "```json",
+                json.dumps(capability.examples, indent=2, ensure_ascii=True),
+                "```",
+                "",
+                "### Constraints",
+            ]
+        )
+        if capability.constraints:
+            lines.extend([f"- {constraint}" for constraint in capability.constraints])
+        else:
+            lines.append("- (none)")
 
-    async def _safe_search_prompt_guide(self, objective: str) -> str:
-        """Safe wrapper for search_prompt_guide that handles exceptions."""
-        try:
-            return await self.search_prompt_guide(objective)
-        except ServerShutdownError:
-            return "Server is shutting down"
-        except Exception as e:
-            logger.error(f"Unexpected error in search_prompt_guide: {e}")
-            return "Error generating search guide"
+        lines.extend(
+            [
+                "",
+                "### Expected Output Shape",
+                "```json",
+                json.dumps(capability.expected_output_shape, indent=2, sort_keys=True, ensure_ascii=True),
+                "```",
+            ]
+        )
+        return "\n".join(lines)
 
-    async def _safe_list_repos(self) -> List[str]:
-        """Safe wrapper for list_repos that handles exceptions."""
-        try:
-            return await self.list_repos()
-        except ServerShutdownError:
-            return []
-        except Exception as e:
-            logger.error(f"Unexpected error in list_repos: {e}")
-            return []
+    @staticmethod
+    def _format_execution_result_markdown(title: str, result: ExecutionResult) -> str:
+        status = "success" if result.success else "failure"
+        lines = [
+            f"## {title}",
+            "",
+            f"- Status: `{status}`",
+            f"- Exit code: `{result.exit_code}`",
+            f"- Timing (ms): `{result.timing_ms}`",
+        ]
+        if result.safety_rejections:
+            lines.append(f"- Safety rejections: `{len(result.safety_rejections)}`")
+            lines.extend([f"  - {rejection}" for rejection in result.safety_rejections])
+
+        lines.extend(["", "### Result JSON", "```json", json.dumps(result.result_json, indent=2, ensure_ascii=True), "```"])
+
+        if result.stdout:
+            lines.extend(["", "### Stdout", "```text", result.stdout, "```"])
+        if result.stderr:
+            lines.extend(["", "### Stderr", "```text", result.stderr, "```"])
+
+        return "\n".join(lines)
 
     def _register_tools(self) -> None:
-        """Register MCP tools with the server."""
         tools = [
-            (self._safe_search, "search", self.search_tool_description),
-            (self._safe_search_symbols, "search_symbols", self.search_symbols_description),
-            (self._safe_search_prompt_guide, "search_prompt_guide", self.search_prompt_guide_description),
-            (self._safe_fetch_content, "fetch_content", self.fetch_content_description),
-            (self._safe_list_dir, "list_dir", self.list_dir_description),
-            (self._safe_list_repos, "list_repos", "List all tracked and indexed repositories available for searching. Use this first to understand the context map."),
+            (self.search_capabilities, "search_capabilities", self.search_capabilities_description),
+            (self.read_capability, "read_capability", self.read_capability_description),
+            (self.run_workflow, "run_workflow", self.run_workflow_description),
+            (
+                self.execute_ephemeral_script,
+                "execute_ephemeral_script",
+                self.execute_ephemeral_script_description,
+            ),
         ]
 
         for tool_func, tool_name, description in tools:
             self.server.tool(tool_func, name=tool_name, description=description)
-            logger.info(f"Registered tool: {tool_name}")
+            logger.info("Registered tool: %s", tool_name)
 
     def _register_health_endpoints(self) -> None:
-        """Register health check endpoints."""
-
         @self.server.custom_route("/health", methods=["GET"])
         async def health_check(request: Request) -> Response:
-            """Simple health check endpoint for liveness probe."""
             return JSONResponse({"status": "ok", "service": "zoekt-mcp"})
 
         @self.server.custom_route("/ready", methods=["GET"])
         async def readiness_check(request: Request) -> Response:
-            """Readiness check endpoint that verifies the service is ready."""
             try:
-                # Check if search client is available
-                if not hasattr(self, "search_client") or self.search_client is None:
-                    return JSONResponse({"status": "not_ready", "reason": "search_client_unavailable"}, status_code=503)
+                if not hasattr(self, "capability_catalog") or self.capability_catalog is None:
+                    return JSONResponse({"status": "not_ready", "reason": "capability_catalog_unavailable"}, status_code=503)
 
-                # Check if content fetcher is available
-                if not hasattr(self, "content_fetcher") or self.content_fetcher is None:
+                if not hasattr(self, "execution_runner") or self.execution_runner is None:
+                    return JSONResponse({"status": "not_ready", "reason": "execution_runner_unavailable"}, status_code=503)
+
+                if not self.manifest_path.exists():
                     return JSONResponse(
-                        {"status": "not_ready", "reason": "content_fetcher_unavailable"}, status_code=503
+                        {"status": "not_ready", "reason": f"manifest_missing:{self.manifest_path}"},
+                        status_code=503,
                     )
 
-                return JSONResponse({"status": "ready", "service": "zoekt-mcp", "backend": "zoekt"})
-            except Exception as e:
-                logger.error(f"Readiness check failed: {e}")
-                return JSONResponse({"status": "error", "reason": str(e)}, status_code=503)
+                return JSONResponse(
+                    {
+                        "status": "ready",
+                        "service": "zoekt-mcp",
+                        "mode": "capability-workflow-executor",
+                    }
+                )
+            except Exception as exc:
+                logger.error("Readiness check failed: %s", exc)
+                return JSONResponse({"status": "error", "reason": str(exc)}, status_code=503)
 
     async def _run_server(self) -> None:
-        """Run the FastMCP server with both HTTP and SSE transports."""
-
         tasks = [
             self.server.run_http_async(
                 transport="streamable-http",
@@ -310,7 +369,6 @@ class ZoektMCPServer:
         await asyncio.gather(*tasks)
 
     async def run(self) -> None:
-        """Start the search server."""
         signal.signal(signal.SIGINT, lambda sig, frame: self.signal_handler(sig, frame))
         signal.signal(signal.SIGTERM, lambda sig, frame: self.signal_handler(sig, frame))
 
@@ -323,7 +381,7 @@ class ZoektMCPServer:
         except KeyboardInterrupt:
             logger.info("Received keyboard interrupt (CTRL+C)")
         except Exception as exc:
-            logger.error(f"Server error: {exc}")
+            logger.error("Server error: %s", exc)
             raise
         finally:
             logger.info("Server has shut down.")

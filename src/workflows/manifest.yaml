@@ -1,0 +1,425 @@
+workflows:
+  - id: repo_discovery
+    summary: Discover relevant repositories for a topic or component.
+    when_to_use: Start here when you do not know which repos likely contain the target code.
+    required_args:
+      - query
+    example: 'run_workflow(repo_discovery, {"query": "billing retry"})'
+    description: |
+      Discover candidate repositories for an objective by running a repository-focused Zoekt search.
+      This workflow transforms the objective into a `type:repo` query and returns ranked repository names.
+    script_path: workflows/scripts/repo_discovery.py
+    arg_schema:
+      query:
+        type: string
+        required: true
+        description: Free-form intent or component keywords used to discover candidate repos.
+      limit:
+        type: integer
+        required: false
+        default: 10
+        description: Maximum search results to request.
+    examples:
+      - call: run_workflow
+        args:
+          workflow_id: repo_discovery
+          args:
+            query: auth token refresh
+            limit: 12
+    constraints:
+      - Keep `limit` small (5-15) for focused discovery.
+      - Uses Zoekt repository search mode (`type:repo`).
+    expected_output_shape:
+      repositories: list[string]
+      results: list[object]
+      total_hits: integer
+
+  - id: symbol_definition
+    summary: Find likely symbol definitions across repositories.
+    when_to_use: Use when you need where a class/function/type is defined.
+    required_args:
+      - query
+    example: 'run_workflow(symbol_definition, {"query": "SendMessage lang:go"})'
+    description: |
+      Uses symbol-focused search to locate likely definition sites for a named symbol.
+      Supports passing additional Zoekt filters inside `query` (for example repo/lang filters).
+    script_path: workflows/scripts/symbol_definition.py
+    arg_schema:
+      query:
+        type: string
+        required: true
+        description: Symbol query, optionally with filters (repo/lang/etc).
+      limit:
+        type: integer
+        required: false
+        default: 10
+        description: Maximum number of hits.
+    examples:
+      - call: run_workflow
+        args:
+          workflow_id: symbol_definition
+          args:
+            query: PaymentService lang:python
+    constraints:
+      - Focused on definitions, not general usages.
+      - Prefer adding `lang:` and `r:` filters for precision.
+    expected_output_shape:
+      query: string
+      results: list[object]
+      total_hits: integer
+
+  - id: symbol_usage
+    summary: Locate usages/call-sites of a symbol or API.
+    when_to_use: Use after definitions are known and you need references/usages.
+    required_args:
+      - query
+    example: 'run_workflow(symbol_usage, {"query": "ProcessOrder r:checkout"})'
+    description: |
+      Runs regular content search to surface symbol usage and call sites.
+      Returns contextual snippets to help understand invocation patterns.
+    script_path: workflows/scripts/symbol_usage.py
+    arg_schema:
+      query:
+        type: string
+        required: true
+        description: Content query for usage/call-site discovery.
+      limit:
+        type: integer
+        required: false
+        default: 10
+        description: Maximum number of hit groups.
+      context_lines:
+        type: integer
+        required: false
+        default: 2
+        description: Context lines around each match.
+    examples:
+      - call: run_workflow
+        args:
+          workflow_id: symbol_usage
+          args:
+            query: ProcessOrder -f:test lang:go
+            limit: 8
+            context_lines: 1
+    constraints:
+      - For definitions use `symbol_definition` instead.
+      - Keep context lines low for compact output.
+    expected_output_shape:
+      query: string
+      results: list[object]
+      total_hits: integer
+
+  - id: file_context_reader
+    summary: Read a bounded line window from a file.
+    when_to_use: Use when a specific file/line range is known and must be inspected.
+    required_args:
+      - repo
+      - path
+      - start_line
+      - end_line
+    example: 'run_workflow(file_context_reader, {"repo":"github.com/org/repo","path":"src/app.py","start_line":1,"end_line":120})'
+    description: |
+      Reads a specific line range from a file in a repository.
+      Intended for focused code understanding after discovery phases.
+    script_path: workflows/scripts/file_context_reader.py
+    arg_schema:
+      repo:
+        type: string
+        required: true
+        description: Repository identifier.
+      path:
+        type: string
+        required: true
+        description: File path inside repository.
+      start_line:
+        type: integer
+        required: true
+        description: 1-indexed start line.
+      end_line:
+        type: integer
+        required: true
+        description: 1-indexed end line.
+    examples:
+      - call: run_workflow
+        args:
+          workflow_id: file_context_reader
+          args:
+            repo: github.com/org/payments
+            path: src/service.py
+            start_line: 40
+            end_line: 140
+    constraints:
+      - Requires a file path, not a directory.
+      - Keep ranges bounded.
+    expected_output_shape:
+      repo: string
+      path: string
+      start_line: integer
+      end_line: integer
+      content: string
+
+  - id: cross_repo_trace
+    summary: Build a quick cross-repository trace for a symbol.
+    when_to_use: Use when you need a high-level map of definitions/usages across repos.
+    required_args:
+      - symbol
+    example: 'run_workflow(cross_repo_trace, {"symbol":"UserService"})'
+    description: |
+      Enumerates repositories, then performs lightweight definition and usage searches per repo.
+      Produces a compact cross-repo trace summary.
+    script_path: workflows/scripts/cross_repo_trace.py
+    arg_schema:
+      symbol:
+        type: string
+        required: true
+        description: Symbol or API token to trace.
+      max_repos:
+        type: integer
+        required: false
+        default: 8
+        description: Maximum repositories to probe.
+      definitions_limit:
+        type: integer
+        required: false
+        default: 2
+        description: Max definition hits per repository.
+      usages_limit:
+        type: integer
+        required: false
+        default: 3
+        description: Max usage hits per repository.
+    examples:
+      - call: run_workflow
+        args:
+          workflow_id: cross_repo_trace
+          args:
+            symbol: FeatureFlagClient
+            max_repos: 6
+    constraints:
+      - Intended as a first-pass trace, not exhaustive indexing.
+      - Follow up with narrower workflows after identifying candidate repos.
+    expected_output_shape:
+      symbol: string
+      inspected_repos: integer
+      trace: list[object]
+
+runtime_tools:
+  - id: runtime.search
+    summary: General Zoekt content search wrapper.
+    when_to_use: Use for broad code/content discovery or usage search.
+    required_args:
+      - query
+    example: 'runtime.zoekt_tools.search(query="payment retry", limit=8, context_lines=1)'
+    description: Search indexed repositories using Zoekt query syntax.
+    arg_schema:
+      query:
+        type: string
+        required: true
+      limit:
+        type: integer
+        required: false
+      context_lines:
+        type: integer
+        required: false
+    examples:
+      - call: runtime.zoekt_tools.search
+        args:
+          query: error handler lang:python
+          limit: 8
+          context_lines: 1
+    constraints:
+      - Respect small limits and focused queries.
+    expected_output_shape:
+      results: list[object]
+
+  - id: runtime.search_symbols
+    summary: Symbol-focused Zoekt search wrapper.
+    when_to_use: Use primarily to find symbol definitions.
+    required_args:
+      - query
+    example: 'runtime.zoekt_tools.search_symbols(query="PaymentClient lang:go", limit=8)'
+    description: Symbol-oriented search helper for definitions.
+    arg_schema:
+      query:
+        type: string
+        required: true
+      limit:
+        type: integer
+        required: false
+    examples:
+      - call: runtime.zoekt_tools.search_symbols
+        args:
+          query: UserController lang:python
+          limit: 10
+    constraints:
+      - Prefer for definition lookup.
+    expected_output_shape:
+      results: list[object]
+
+  - id: runtime.fetch_content
+    summary: Fetch a bounded file content range.
+    when_to_use: Use once repo/path and line window are known.
+    required_args:
+      - repo
+      - path
+      - start_line
+      - end_line
+    example: 'runtime.zoekt_tools.fetch_content(repo="github.com/org/repo", path="src/main.go", start_line=1, end_line=120)'
+    description: Fetch file content from Zoekt print endpoint.
+    arg_schema:
+      repo:
+        type: string
+        required: true
+      path:
+        type: string
+        required: true
+      start_line:
+        type: integer
+        required: true
+      end_line:
+        type: integer
+        required: true
+    examples:
+      - call: runtime.zoekt_tools.fetch_content
+        args:
+          repo: github.com/org/repo
+          path: src/main.go
+          start_line: 1
+          end_line: 120
+    constraints:
+      - Requires a file path; directories are invalid.
+    expected_output_shape:
+      content: string
+
+  - id: runtime.list_dir
+    summary: List directory tree for repository path.
+    when_to_use: Use for repository structure exploration.
+    required_args:
+      - repo
+    example: 'runtime.zoekt_tools.list_dir(repo="github.com/org/repo", path="src", depth=2)'
+    description: List directory structure under a repository path.
+    arg_schema:
+      repo:
+        type: string
+        required: true
+      path:
+        type: string
+        required: false
+      depth:
+        type: integer
+        required: false
+    examples:
+      - call: runtime.zoekt_tools.list_dir
+        args:
+          repo: github.com/org/repo
+          path: src
+          depth: 2
+    constraints:
+      - Prefer shallow depth initially.
+    expected_output_shape:
+      tree: string
+
+  - id: runtime.list_repos
+    summary: List all indexed repositories.
+    when_to_use: Use to discover repository scope for further workflows.
+    required_args: []
+    example: "runtime.zoekt_tools.list_repos()"
+    description: Return sorted set of indexed repository names.
+    arg_schema: {}
+    examples:
+      - call: runtime.zoekt_tools.list_repos
+        args: {}
+    constraints:
+      - Use as lightweight scope discovery before targeting specific repos.
+    expected_output_shape:
+      repos: list[string]
+
+execution_patterns:
+  - id: execution.run_workflow
+    summary: Preferred path for repeatable analysis tasks.
+    when_to_use: Use when a prebuilt workflow already fits the objective.
+    required_args:
+      - workflow_id
+      - args
+    example: 'run_workflow(workflow_id="repo_discovery", args={"query":"auth"})'
+    description: Execute a prebuilt workflow script with validated args and timeout controls.
+    arg_schema:
+      workflow_id:
+        type: string
+        required: true
+      args:
+        type: object
+        required: true
+      timeout_seconds:
+        type: integer
+        required: false
+    examples:
+      - call: run_workflow
+        args:
+          workflow_id: symbol_definition
+          args:
+            query: ProcessOrder lang:go
+          timeout_seconds: 30
+    constraints:
+      - Prefer this before generating ephemeral code.
+      - Timeout is capped by server policy.
+    expected_output_shape:
+      success: boolean
+      exit_code: integer
+      result_json: object|null
+
+  - id: execution.execute_ephemeral_script
+    summary: Fallback path for one-off tasks not covered by workflows.
+    when_to_use: Use only when no prebuilt workflow can satisfy the objective.
+    required_args:
+      - code
+    example: 'execute_ephemeral_script(code="...")'
+    description: |
+      Execute generated script code after AST safety checks in an isolated subprocess.
+      Script must follow required entrypoint shape and import allowlist.
+    arg_schema:
+      code:
+        type: string
+        required: true
+      args:
+        type: object
+        required: false
+      timeout_seconds:
+        type: integer
+        required: false
+    examples:
+      - call: execute_ephemeral_script
+        args:
+          code: |
+            import argparse
+            import asyncio
+            import json
+            import sys
+            import runtime.zoekt_tools as zoekt_tools
+
+            RESULT_MARKER = "__RESULT_JSON__="
+
+            def parse_args(argv=None):
+                parser = argparse.ArgumentParser()
+                parser.add_argument("--args-json", required=True)
+                return parser.parse_args(argv)
+
+            async def main():
+                cli = parse_args()
+                payload = json.loads(cli.args_json)
+                query = payload.get("query", "")
+                results = await asyncio.to_thread(zoekt_tools.search, query, 5, 1)
+                print(RESULT_MARKER + json.dumps({"results": results}, ensure_ascii=True))
+                return 0
+
+            if __name__ == "__main__":
+                raise SystemExit(asyncio.run(main()))
+    constraints:
+      - Allowed imports are restricted (argparse/asyncio/json/sys/runtime.zoekt_tools).
+      - Banned imports and calls are rejected before execution.
+      - This is process-level isolation, not container-grade sandboxing.
+    expected_output_shape:
+      success: boolean
+      exit_code: integer
+      safety_rejections: list[string]
+      result_json: object|null
