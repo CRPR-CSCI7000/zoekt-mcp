@@ -12,8 +12,8 @@ from starlette.responses import JSONResponse, Response
 
 from .capabilities import CapabilityCatalog, CapabilityDoc, CapabilityHit
 from .config import ServerConfig
+from .execution import CustomWorkflowCodeRunRequest, ExecutionResult, ExecutionRunner, WorkflowCliRunRequest
 from .prompts import PromptManager
-from .execution import EphemeralRunRequest, ExecutionResult, ExecutionRunner, WorkflowRunRequest
 from .workflows import format_workflow_result_markdown
 
 logging.basicConfig(level=logging.INFO)
@@ -62,15 +62,15 @@ class ZoektMCPServer:
             "tools.read_capability",
             "Read the full capability document by id.",
         )
-        self.run_workflow_description = self._load_prompt_with_default(
+        self.run_workflow_cli_description = self._load_prompt_with_default(
             prompt_manager,
-            "tools.run_workflow",
-            "Run a prebuilt workflow by id.",
+            "tools.run_workflow_cli",
+            "Run a prebuilt workflow using CLI-style flags.",
         )
-        self.execute_ephemeral_script_description = self._load_prompt_with_default(
+        self.run_custom_workflow_code_description = self._load_prompt_with_default(
             prompt_manager,
-            "tools.execute_ephemeral_script",
-            "Run an ephemeral script in an isolated subprocess with safety checks.",
+            "tools.run_custom_workflow_code",
+            "Run custom workflow code in an isolated subprocess with safety checks.",
         )
 
     @staticmethod
@@ -118,45 +118,47 @@ class ZoektMCPServer:
                 self._error_capability_doc(capability_id, f"runner internal exception: {exc}")
             )
 
-    async def run_workflow(
+    async def run_workflow_cli(
         self,
-        workflow_id: str,
-        args: dict[str, Any],
+        command: str,
         timeout_seconds: int = 30,
     ) -> str:
         if self._shutdown_requested:
             return self._format_execution_result_markdown(
-                "Workflow Execution",
+                "Workflow CLI Execution",
                 self._error_execution_result("server is shutting down"),
             )
 
         try:
-            request = WorkflowRunRequest(
-                workflow_id=workflow_id,
-                args=args,
+            request = WorkflowCliRunRequest(
+                command=command,
                 timeout_seconds=timeout_seconds,
             )
         except Exception as exc:
             return self._format_execution_result_markdown(
-                "Workflow Execution",
+                "Workflow CLI Execution",
                 self._error_execution_result(f"args validation failure: {exc}", exit_code=2),
             )
 
         try:
-            result = await self.execution_runner.run_workflow_script(
-                workflow_id=request.workflow_id,
-                args=request.args,
+            workflow_id, result = await self.execution_runner.run_workflow_cli_command(
+                command=request.command,
                 timeout_seconds=request.timeout_seconds,
             )
-            return format_workflow_result_markdown(request.workflow_id, result)
+            return format_workflow_result_markdown(workflow_id, result)
+        except ValueError as exc:
+            return self._format_execution_result_markdown(
+                "Workflow CLI Execution",
+                self._error_execution_result(str(exc), exit_code=2),
+            )
         except Exception as exc:
-            logger.exception("run_workflow internal exception")
-            return format_workflow_result_markdown(
-                request.workflow_id,
+            logger.exception("run_workflow_cli internal exception")
+            return self._format_execution_result_markdown(
+                "Workflow CLI Execution",
                 self._error_execution_result(f"runner internal exception: {exc}"),
             )
 
-    async def execute_ephemeral_script(
+    async def run_custom_workflow_code(
         self,
         code: str,
         args: dict[str, Any] | None = None,
@@ -164,33 +166,33 @@ class ZoektMCPServer:
     ) -> str:
         if self._shutdown_requested:
             return self._format_execution_result_markdown(
-                "Ephemeral Script Execution",
+                "Custom Workflow Code Execution",
                 self._error_execution_result("server is shutting down"),
             )
 
         try:
-            request = EphemeralRunRequest(
+            request = CustomWorkflowCodeRunRequest(
                 code=code,
                 args=args or {},
                 timeout_seconds=timeout_seconds,
             )
         except Exception as exc:
             return self._format_execution_result_markdown(
-                "Ephemeral Script Execution",
+                "Custom Workflow Code Execution",
                 self._error_execution_result(f"args validation failure: {exc}", exit_code=2),
             )
 
         try:
-            result = await self.execution_runner.run_ephemeral_script(
+            result = await self.execution_runner.run_custom_workflow_code(
                 code=request.code,
                 args=request.args,
                 timeout_seconds=request.timeout_seconds,
             )
-            return self._format_execution_result_markdown("Ephemeral Script Execution", result)
+            return self._format_execution_result_markdown("Custom Workflow Code Execution", result)
         except Exception as exc:
-            logger.exception("execute_ephemeral_script internal exception")
+            logger.exception("run_custom_workflow_code internal exception")
             return self._format_execution_result_markdown(
-                "Ephemeral Script Execution",
+                "Custom Workflow Code Execution",
                 self._error_execution_result(f"runner internal exception: {exc}"),
             )
 
@@ -225,8 +227,19 @@ class ZoektMCPServer:
     @staticmethod
     def _format_capability_hits_markdown(query: str, hits: list[CapabilityHit]) -> str:
         lines = ["## Capability Search Results", "", f"- Query: `{query}`", f"- Hits: `{len(hits)}`", ""]
+        lines.extend(ZoektMCPServer._capability_kind_legend())
+        lines.append("")
         if not hits:
-            lines.append("No capabilities matched.")
+            lines.extend(
+                [
+                    "No capabilities matched.",
+                    "",
+                    "Try a broader query:",
+                    "- Use 2-5 keywords, not a full sentence.",
+                    "- Start with intent words like `repo discovery`, `symbol definition`, `symbol usage`, or `file context`.",
+                    "- Drop stack traces, exact error text, and very specific literals.",
+                ]
+            )
             return "\n".join(lines)
 
         for index, hit in enumerate(hits, start=1):
@@ -247,6 +260,8 @@ class ZoektMCPServer:
     @staticmethod
     def _format_capability_doc_markdown(capability: CapabilityDoc) -> str:
         lines = [f"## Capability: `{capability.id}`", "", f"- Kind: `{capability.kind}`", ""]
+        lines.extend(ZoektMCPServer._capability_kind_legend())
+        lines.append("")
         if capability.description:
             lines.extend(["### Description", capability.description, ""])
 
@@ -282,12 +297,23 @@ class ZoektMCPServer:
         return "\n".join(lines)
 
     @staticmethod
+    def _capability_kind_legend() -> list[str]:
+        return [
+            "### Capability Types",
+            "- `workflow`: prebuilt analysis flows invoked with `run_workflow_cli`.",
+            "- `runtime_tool`: Python helpers available in custom code as `runtime.zoekt_tools.*`.",
+            "- `execution_pattern`: guidance capabilities for execution interfaces (prefix `execution.*`).",
+        ]
+
+    @staticmethod
     def _format_execution_result_markdown(title: str, result: ExecutionResult) -> str:
-        status = "success" if result.success else "failure"
+        process_status = "success" if result.success else "failure"
+        output_status = ZoektMCPServer._infer_output_status(result)
         lines = [
             f"## {title}",
             "",
-            f"- Status: `{status}`",
+            f"- Process status: `{process_status}`",
+            f"- Output status: `{output_status}`",
             f"- Exit code: `{result.exit_code}`",
             f"- Timing (ms): `{result.timing_ms}`",
         ]
@@ -304,15 +330,29 @@ class ZoektMCPServer:
 
         return "\n".join(lines)
 
+    @staticmethod
+    def _infer_output_status(result: ExecutionResult) -> str:
+        if result.result_json is not None:
+            return "parsed"
+
+        stderr_lc = (result.stderr or "").lower()
+        if "malformed result marker json" in stderr_lc:
+            return "parse_error"
+        if "result marker not found" in stderr_lc:
+            return "missing_result_marker"
+        if result.success:
+            return "missing_payload"
+        return "not_available"
+
     def _register_tools(self) -> None:
         tools = [
             (self.search_capabilities, "search_capabilities", self.search_capabilities_description),
             (self.read_capability, "read_capability", self.read_capability_description),
-            (self.run_workflow, "run_workflow", self.run_workflow_description),
+            (self.run_workflow_cli, "run_workflow_cli", self.run_workflow_cli_description),
             (
-                self.execute_ephemeral_script,
-                "execute_ephemeral_script",
-                self.execute_ephemeral_script_description,
+                self.run_custom_workflow_code,
+                "run_custom_workflow_code",
+                self.run_custom_workflow_code_description,
             ),
         ]
 

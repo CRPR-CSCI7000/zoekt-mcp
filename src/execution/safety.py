@@ -36,7 +36,7 @@ class SafetyError(ValueError):
     """Raised when script safety validation cannot run."""
 
 
-def validate_ephemeral_script(code: str) -> list[str]:
+def validate_custom_workflow_code(code: str) -> list[str]:
     try:
         tree = ast.parse(code)
     except SyntaxError as exc:
@@ -45,15 +45,19 @@ def validate_ephemeral_script(code: str) -> list[str]:
     rejections: list[str] = []
 
     has_parse_args = False
-    has_async_main = False
+    has_main = False
     has_main_guard = False
+    has_run = False
 
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef) and node.name == "parse_args":
             has_parse_args = True
 
-        if isinstance(node, ast.AsyncFunctionDef) and node.name == "main":
-            has_async_main = True
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "main":
+            has_main = True
+
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "run":
+            has_run = True
 
         if isinstance(node, ast.If) and _is_name_main_guard(node.test):
             has_main_guard = True
@@ -72,12 +76,17 @@ def validate_ephemeral_script(code: str) -> list[str]:
             if call_name in _BANNED_CALLS:
                 rejections.append(f"banned_call: {call_name}")
 
-    if not has_parse_args:
-        rejections.append("missing_required_entrypoint: parse_args")
-    if not has_async_main:
-        rejections.append("missing_required_entrypoint: async main")
-    if not has_main_guard:
-        rejections.append("missing_required_entrypoint: if __name__ == '__main__'")
+    has_legacy_entrypoint = has_parse_args and has_main and has_main_guard
+    has_minimal_entrypoint = has_run
+    if not has_minimal_entrypoint and not has_legacy_entrypoint:
+        if not has_run:
+            rejections.append("missing_required_entrypoint: run(args) or async run(args)")
+        if not has_parse_args:
+            rejections.append("missing_required_entrypoint: parse_args (legacy mode)")
+        if not has_main:
+            rejections.append("missing_required_entrypoint: main (legacy mode)")
+        if not has_main_guard:
+            rejections.append("missing_required_entrypoint: if __name__ == '__main__' (legacy mode)")
 
     seen: set[str] = set()
     unique_rejections: list[str] = []
@@ -87,6 +96,10 @@ def validate_ephemeral_script(code: str) -> list[str]:
             seen.add(rejection)
 
     return unique_rejections
+
+
+def validate_ephemeral_script(code: str) -> list[str]:
+    return validate_custom_workflow_code(code)
 
 
 def _check_import(module_name: str, rejections: list[str]) -> None:

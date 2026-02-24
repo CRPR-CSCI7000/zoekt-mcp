@@ -4,7 +4,7 @@ workflows:
     when_to_use: Start here when you do not know which repos likely contain the target code.
     required_args:
       - query
-    example: 'run_workflow(repo_discovery, {"query": "billing retry"})'
+    example: 'run_workflow_cli(command="repo_discovery --query ''billing retry''")'
     description: |
       Discover candidate repositories for an objective by running a repository-focused Zoekt search.
       This workflow transforms the objective into a `type:repo` query and returns ranked repository names.
@@ -20,12 +20,9 @@ workflows:
         default: 10
         description: Maximum search results to request.
     examples:
-      - call: run_workflow
+      - call: run_workflow_cli
         args:
-          workflow_id: repo_discovery
-          args:
-            query: auth token refresh
-            limit: 12
+          command: repo_discovery --query "auth token refresh" --limit 12
     constraints:
       - Keep `limit` small (5-15) for focused discovery.
       - Uses Zoekt repository search mode (`type:repo`).
@@ -39,7 +36,7 @@ workflows:
     when_to_use: Use when you need where a class/function/type is defined.
     required_args:
       - query
-    example: 'run_workflow(symbol_definition, {"query": "SendMessage lang:go"})'
+    example: 'run_workflow_cli(command="symbol_definition --query ''SendMessage lang:go''")'
     description: |
       Uses symbol-focused search to locate likely definition sites for a named symbol.
       Supports passing additional Zoekt filters inside `query` (for example repo/lang filters).
@@ -55,11 +52,9 @@ workflows:
         default: 10
         description: Maximum number of hits.
     examples:
-      - call: run_workflow
+      - call: run_workflow_cli
         args:
-          workflow_id: symbol_definition
-          args:
-            query: PaymentService lang:python
+          command: symbol_definition --query "PaymentService lang:python"
     constraints:
       - Focused on definitions, not general usages.
       - Prefer adding `lang:` and `r:` filters for precision.
@@ -73,7 +68,7 @@ workflows:
     when_to_use: Use after definitions are known and you need references/usages.
     required_args:
       - query
-    example: 'run_workflow(symbol_usage, {"query": "ProcessOrder r:checkout"})'
+    example: 'run_workflow_cli(command="symbol_usage --query ''ProcessOrder r:checkout''")'
     description: |
       Runs regular content search to surface symbol usage and call sites.
       Returns contextual snippets to help understand invocation patterns.
@@ -94,13 +89,9 @@ workflows:
         default: 2
         description: Context lines around each match.
     examples:
-      - call: run_workflow
+      - call: run_workflow_cli
         args:
-          workflow_id: symbol_usage
-          args:
-            query: ProcessOrder -f:test lang:go
-            limit: 8
-            context_lines: 1
+          command: symbol_usage --query "ProcessOrder -f:test lang:go" --limit 8 --context-lines 1
     constraints:
       - For definitions use `symbol_definition` instead.
       - Keep context lines low for compact output.
@@ -117,7 +108,7 @@ workflows:
       - path
       - start_line
       - end_line
-    example: 'run_workflow(file_context_reader, {"repo":"github.com/org/repo","path":"src/app.py","start_line":1,"end_line":120})'
+    example: 'run_workflow_cli(command="file_context_reader --repo github.com/org/repo --path src/app.py --start-line 1 --end-line 120")'
     description: |
       Reads a specific line range from a file in a repository.
       Intended for focused code understanding after discovery phases.
@@ -140,14 +131,9 @@ workflows:
         required: true
         description: 1-indexed end line.
     examples:
-      - call: run_workflow
+      - call: run_workflow_cli
         args:
-          workflow_id: file_context_reader
-          args:
-            repo: github.com/org/payments
-            path: src/service.py
-            start_line: 40
-            end_line: 140
+          command: file_context_reader --repo github.com/org/payments --path src/service.py --start-line 40 --end-line 140
     constraints:
       - Requires a file path, not a directory.
       - Keep ranges bounded.
@@ -163,7 +149,7 @@ workflows:
     when_to_use: Use when you need a high-level map of definitions/usages across repos.
     required_args:
       - symbol
-    example: 'run_workflow(cross_repo_trace, {"symbol":"UserService"})'
+    example: 'run_workflow_cli(command="cross_repo_trace --symbol UserService")'
     description: |
       Enumerates repositories, then performs lightweight definition and usage searches per repo.
       Produces a compact cross-repo trace summary.
@@ -189,12 +175,9 @@ workflows:
         default: 3
         description: Max usage hits per repository.
     examples:
-      - call: run_workflow
+      - call: run_workflow_cli
         args:
-          workflow_id: cross_repo_trace
-          args:
-            symbol: FeatureFlagClient
-            max_repos: 6
+          command: cross_repo_trace --symbol FeatureFlagClient --max-repos 6
     constraints:
       - Intended as a first-pass trace, not exhaustive indexing.
       - Follow up with narrower workflows after identifying candidate repos.
@@ -335,48 +318,43 @@ runtime_tools:
       repos: list[string]
 
 execution_patterns:
-  - id: execution.run_workflow
+  - id: execution.run_workflow_cli
     summary: Preferred path for repeatable analysis tasks.
     when_to_use: Use when a prebuilt workflow already fits the objective.
     required_args:
-      - workflow_id
-      - args
-    example: 'run_workflow(workflow_id="repo_discovery", args={"query":"auth"})'
-    description: Execute a prebuilt workflow script with validated args and timeout controls.
+      - command
+    example: 'run_workflow_cli(command="repo_discovery --query ''auth''")'
+    description: Execute a prebuilt workflow script via CLI-style command flags and timeout controls.
     arg_schema:
-      workflow_id:
+      command:
         type: string
-        required: true
-      args:
-        type: object
         required: true
       timeout_seconds:
         type: integer
         required: false
     examples:
-      - call: run_workflow
+      - call: run_workflow_cli
         args:
-          workflow_id: symbol_definition
-          args:
-            query: ProcessOrder lang:go
+          command: symbol_definition --query "ProcessOrder lang:go"
           timeout_seconds: 30
     constraints:
-      - Prefer this before generating ephemeral code.
+      - Prefer this before generating custom workflow code.
       - Timeout is capped by server policy.
     expected_output_shape:
       success: boolean
       exit_code: integer
       result_json: object|null
 
-  - id: execution.execute_ephemeral_script
+  - id: execution.run_custom_workflow_code
     summary: Fallback path for one-off tasks not covered by workflows.
     when_to_use: Use only when no prebuilt workflow can satisfy the objective.
     required_args:
       - code
-    example: 'execute_ephemeral_script(code="...")'
+    example: 'run_custom_workflow_code(code="...")'
     description: |
-      Execute generated script code after AST safety checks in an isolated subprocess.
-      Script must follow required entrypoint shape and import allowlist.
+      Execute generated code after AST safety checks in an isolated subprocess.
+      Preferred entrypoint shape is `run(args)` or `async run(args)`.
+      Legacy `parse_args/main/__main__` scripts are still accepted.
     arg_schema:
       code:
         type: string
@@ -388,32 +366,16 @@ execution_patterns:
         type: integer
         required: false
     examples:
-      - call: execute_ephemeral_script
+      - call: run_custom_workflow_code
         args:
           code: |
-            import argparse
             import asyncio
-            import json
-            import sys
             import runtime.zoekt_tools as zoekt_tools
 
-            RESULT_MARKER = "__RESULT_JSON__="
-
-            def parse_args(argv=None):
-                parser = argparse.ArgumentParser()
-                parser.add_argument("--args-json", required=True)
-                return parser.parse_args(argv)
-
-            async def main():
-                cli = parse_args()
-                payload = json.loads(cli.args_json)
-                query = payload.get("query", "")
+            async def run(args):
+                query = str(args.get("query", "")).strip()
                 results = await asyncio.to_thread(zoekt_tools.search, query, 5, 1)
-                print(RESULT_MARKER + json.dumps({"results": results}, ensure_ascii=True))
-                return 0
-
-            if __name__ == "__main__":
-                raise SystemExit(asyncio.run(main()))
+                return {"results": results}
     constraints:
       - Allowed imports are restricted (argparse/asyncio/json/sys/runtime.zoekt_tools).
       - Banned imports and calls are rejected before execution.

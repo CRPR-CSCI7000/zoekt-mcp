@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import shlex
 import shutil
 import sys
 import tempfile
@@ -11,7 +12,7 @@ from typing import Any
 import yaml
 
 from .models import ExecutionResult
-from .safety import validate_ephemeral_script
+from .safety import validate_custom_workflow_code
 
 RESULT_MARKER = "__RESULT_JSON__="
 TIMEOUT_EXIT_CODE = 124
@@ -55,6 +56,86 @@ class ExecutionRunner:
                 workflow_index[workflow_id] = workflow
         return workflow_index
 
+    def parse_workflow_cli_command(self, command: str) -> tuple[str, dict[str, Any]]:
+        command = command.strip()
+        if not command:
+            raise ValueError("args validation failure: command must not be empty")
+
+        try:
+            tokens = shlex.split(command, posix=True)
+        except ValueError as exc:
+            raise ValueError(f"args validation failure: invalid command: {exc}") from exc
+
+        if not tokens:
+            raise ValueError("args validation failure: command must not be empty")
+
+        workflow_id = tokens[0]
+        workflow = self._workflow_index.get(workflow_id)
+        if workflow is None:
+            available = ", ".join(sorted(self._workflow_index))
+            raise ValueError(
+                f"args validation failure: unknown workflow_id: {workflow_id}. Available workflows: {available}"
+            )
+
+        arg_schema = workflow.get("arg_schema")
+        if not isinstance(arg_schema, dict):
+            arg_schema = {}
+
+        usage = self._workflow_usage(workflow_id, arg_schema)
+        flag_aliases = self._workflow_flag_aliases(arg_schema)
+        parsed_args: dict[str, Any] = {}
+
+        index = 1
+        while index < len(tokens):
+            token = tokens[index]
+            if not token.startswith("--"):
+                raise ValueError(f"args validation failure: unexpected positional argument `{token}`. {usage}")
+
+            arg_name = flag_aliases.get(token)
+            if arg_name is None:
+                raise ValueError(f"args validation failure: unknown flag `{token}`. {usage}")
+            if arg_name in parsed_args:
+                raise ValueError(f"args validation failure: duplicate flag `{token}`. {usage}")
+            if index + 1 >= len(tokens):
+                raise ValueError(f"args validation failure: missing value for `{token}`. {usage}")
+
+            value_token = tokens[index + 1]
+            if value_token.startswith("--"):
+                raise ValueError(f"args validation failure: missing value for `{token}`. {usage}")
+
+            schema = arg_schema.get(arg_name)
+            if not isinstance(schema, dict):
+                schema = {"type": "string"}
+            parsed_args[arg_name] = self._coerce_cli_arg_value(arg_name, value_token, schema, usage)
+            index += 2
+
+        for arg_name, schema in arg_schema.items():
+            if arg_name in parsed_args:
+                continue
+            if not isinstance(schema, dict) or "default" not in schema:
+                continue
+            parsed_args[arg_name] = self._coerce_cli_arg_value(arg_name, schema["default"], schema, usage)
+
+        missing = [
+            arg_name
+            for arg_name, schema in arg_schema.items()
+            if isinstance(schema, dict) and schema.get("required") and arg_name not in parsed_args
+        ]
+        if missing:
+            missing_flags = ", ".join(f"--{arg_name.replace('_', '-')}" for arg_name in missing)
+            raise ValueError(f"args validation failure: missing required flags: {missing_flags}. {usage}")
+
+        return workflow_id, parsed_args
+
+    async def run_workflow_cli_command(self, command: str, timeout_seconds: int) -> tuple[str, ExecutionResult]:
+        workflow_id, args = self.parse_workflow_cli_command(command)
+        result = await self.run_workflow_script(
+            workflow_id=workflow_id,
+            args=args,
+            timeout_seconds=timeout_seconds,
+        )
+        return workflow_id, result
+
     async def run_workflow_script(
         self,
         workflow_id: str,
@@ -94,31 +175,31 @@ class ExecutionRunner:
                 if temp_script_path.exists():
                     temp_script_path.unlink()
 
-    async def run_ephemeral_script(
+    async def run_custom_workflow_code(
         self,
         code: str,
         args: dict[str, Any],
         timeout_seconds: int,
     ) -> ExecutionResult:
-        rejections = validate_ephemeral_script(code)
+        rejections = validate_custom_workflow_code(code)
         if rejections:
             return ExecutionResult(
                 success=False,
                 exit_code=1,
-                stderr="ephemeral script rejected by safety policy",
+                stderr="custom workflow code rejected by safety policy",
                 safety_rejections=rejections,
             )
 
-        with tempfile.TemporaryDirectory(prefix="zoekt-ephemeral-") as temp_dir_name:
+        with tempfile.TemporaryDirectory(prefix="zoekt-custom-workflow-") as temp_dir_name:
             temp_dir = Path(temp_dir_name)
-            script_path = temp_dir / "ephemeral_script.py"
+            script_path = temp_dir / "custom_workflow_code.py"
             runtime_src = self.src_root / "runtime"
             runtime_dst = temp_dir / "runtime"
 
             script_path.write_text(code, encoding="utf-8")
             shutil.copytree(runtime_src, runtime_dst, dirs_exist_ok=True)
 
-            command = self._build_isolated_command(script_path, args)
+            command = self._build_custom_workflow_command(script_path, args)
 
             try:
                 return await self._execute(command=command, cwd=temp_dir, timeout_seconds=timeout_seconds)
@@ -171,7 +252,7 @@ class ExecutionRunner:
         stdout = self._cap_text(cleaned_stdout_full, self.stdout_max_bytes, "stdout")
         stderr = self._cap_text(full_stderr, self.stderr_max_bytes, "stderr")
 
-        if not marker_found:
+        if not marker_found and result_json is None:
             marker_error = "result marker not found"
             stderr = f"{stderr}\n{marker_error}" if stderr else marker_error
         if parse_error:
@@ -204,6 +285,54 @@ class ExecutionRunner:
             return f"args validation failure: missing required args: {missing_csv}"
         return None
 
+    @staticmethod
+    def _workflow_flag_aliases(arg_schema: dict[str, Any]) -> dict[str, str]:
+        aliases: dict[str, str] = {}
+        for arg_name in arg_schema.keys():
+            if not isinstance(arg_name, str):
+                continue
+            aliases[f"--{arg_name}"] = arg_name
+            aliases[f"--{arg_name.replace('_', '-')}"] = arg_name
+        return aliases
+
+    @staticmethod
+    def _workflow_usage(workflow_id: str, arg_schema: dict[str, Any]) -> str:
+        parts: list[str] = []
+        for arg_name, schema in arg_schema.items():
+            if not isinstance(arg_name, str):
+                continue
+            flag = f"--{arg_name.replace('_', '-')}"
+            is_required = isinstance(schema, dict) and bool(schema.get("required"))
+            fragment = f"{flag} <value>" if is_required else f"[{flag} <value>]"
+            parts.append(fragment)
+        suffix = f" {' '.join(parts)}" if parts else ""
+        return f"Usage: {workflow_id}{suffix}"
+
+    @staticmethod
+    def _coerce_cli_arg_value(arg_name: str, raw_value: Any, schema: dict[str, Any], usage: str) -> Any:
+        arg_type = str(schema.get("type", "string")).strip().lower()
+        if arg_type == "string":
+            return str(raw_value)
+        if arg_type == "integer":
+            try:
+                return int(raw_value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"args validation failure: invalid integer for `--{arg_name.replace('_', '-')}`: {raw_value!r}. {usage}"
+                ) from exc
+        if arg_type == "boolean":
+            value = str(raw_value).strip().lower()
+            if value in {"true", "1", "yes", "on"}:
+                return True
+            if value in {"false", "0", "no", "off"}:
+                return False
+            raise ValueError(
+                f"args validation failure: invalid boolean for `--{arg_name.replace('_', '-')}`: {raw_value!r}. {usage}"
+            )
+        raise ValueError(
+            f"args validation failure: unsupported arg type `{arg_type}` for `--{arg_name.replace('_', '-')}`. {usage}"
+        )
+
     def _build_environment(self) -> dict[str, str]:
         env: dict[str, str] = {}
         for key in _ENV_ALLOWLIST:
@@ -225,6 +354,51 @@ class ExecutionRunner:
             f"sys.path.insert(0,{script_parent!r});"
             f"sys.argv=[script,'--args-json',{args_json!r}];"
             "runpy.run_path(script, run_name='__main__')"
+        )
+        return [sys.executable, "-I", "-u", "-c", bootstrap]
+
+    @staticmethod
+    def _build_custom_workflow_command(script_path: Path, args: dict[str, Any]) -> list[str]:
+        args_json = json.dumps(args, ensure_ascii=True)
+        script = str(script_path)
+        script_parent = str(script_path.parent)
+        bootstrap = (
+            "import asyncio\n"
+            "import inspect\n"
+            "import json\n"
+            "import runpy\n"
+            "import sys\n"
+            f"script = {script!r}\n"
+            f"args_json = {args_json!r}\n"
+            f"result_marker = {RESULT_MARKER!r}\n"
+            f"sys.path.insert(0, {script_parent!r})\n"
+            "namespace = runpy.run_path(script, run_name='__custom_workflow__')\n"
+            "run_fn = namespace.get('run')\n"
+            "if callable(run_fn):\n"
+            "    payload = json.loads(args_json)\n"
+            "    if inspect.iscoroutinefunction(run_fn):\n"
+            "        run_result = asyncio.run(run_fn(payload))\n"
+            "    else:\n"
+            "        run_result = run_fn(payload)\n"
+            "    if isinstance(run_result, int) and not isinstance(run_result, bool):\n"
+            "        exit_code = run_result\n"
+            "        marker_payload = None\n"
+            "    else:\n"
+            "        exit_code = 0\n"
+            "        marker_payload = run_result\n"
+            "    print(result_marker + json.dumps(marker_payload, ensure_ascii=True))\n"
+            "    raise SystemExit(exit_code)\n"
+            "main_fn = namespace.get('main')\n"
+            "if callable(main_fn):\n"
+            "    sys.argv = [script, '--args-json', args_json]\n"
+            "    if inspect.iscoroutinefunction(main_fn):\n"
+            "        main_result = asyncio.run(main_fn())\n"
+            "    else:\n"
+            "        main_result = main_fn()\n"
+            "    if isinstance(main_result, int) and not isinstance(main_result, bool):\n"
+            "        raise SystemExit(main_result)\n"
+            "    raise SystemExit(0)\n"
+            "raise SystemExit('missing entrypoint: expected run(args) or legacy main()')\n"
         )
         return [sys.executable, "-I", "-u", "-c", bootstrap]
 
@@ -264,6 +438,13 @@ class ExecutionRunner:
                 return cleaned_stdout, json.loads(payload), None, True
             except json.JSONDecodeError as exc:
                 return cleaned_stdout, None, f"malformed result marker JSON: {exc.msg}", True
+
+        stripped = stdout.strip()
+        if stripped:
+            try:
+                return "", json.loads(stripped), None, False
+            except json.JSONDecodeError:
+                pass
 
         return stdout, None, None, False
 

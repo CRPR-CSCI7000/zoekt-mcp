@@ -19,8 +19,8 @@ The server exposes only these 4 tools:
 
 1. `search_capabilities(query: str, limit: int = 8)`
 2. `read_capability(capability_id: str)`
-3. `run_workflow(workflow_id: str, args: dict, timeout_seconds: int = 30)`
-4. `execute_ephemeral_script(code: str, args: dict = {}, timeout_seconds: int = 30)`
+3. `run_workflow_cli(command: str, timeout_seconds: int = 30)`
+4. `run_custom_workflow_code(code: str, args: dict = {}, timeout_seconds: int = 30)`
 
 All tool responses are rendered as markdown text for agent readability.
 
@@ -37,16 +37,23 @@ Removed tools:
 
 1. Call `search_capabilities` for the objective.
 2. Call `read_capability` for selected ids.
-3. Prefer `run_workflow` for known tasks.
-4. Use `execute_ephemeral_script` only when workflows do not fit.
+3. Prefer `run_workflow_cli` for known tasks.
+4. Use `run_custom_workflow_code` only when workflows do not fit.
 
-## Ephemeral Script Constraints
+`run_workflow_cli` command format:
+
+- `<workflow_id> [--flag value]...`
+- Example: `symbol_usage --query "ProcessOrder lang:go" --limit 8 --context-lines 1`
+
+## Custom Workflow Code Constraints
 
 Generated scripts are AST-validated before execution:
 
-- Required entrypoint shape:
+- Preferred entrypoint shape:
+  - `def run(args)` or `async def run(args)`
+- Legacy entrypoint shape is still accepted:
   - `def parse_args(...)`
-  - `async def main()`
+  - `def/async def main()`
   - `if __name__ == "__main__": ...`
 - Import allowlist centered on: `argparse`, `asyncio`, `json`, `sys`, and `runtime.zoekt_tools`
 - Banned imports include modules such as `os`, `subprocess`, `socket`, `ctypes`, `multiprocessing`, `pathlib`
@@ -61,6 +68,7 @@ Generated scripts are AST-validated before execution:
 - Scripts can emit a final marker line:
   - `__RESULT_JSON__=<json>`
   - parsed into `ExecutionResult.result_json`
+- If marker is missing but stdout is plain JSON, runner parses stdout as result payload.
 
 This is process-level sandboxing, not container-grade isolation.
 

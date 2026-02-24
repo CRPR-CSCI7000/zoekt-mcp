@@ -21,7 +21,12 @@ class WorkflowRunRequest(BaseModel):
     timeout_seconds: int = 30
 
 
-class EphemeralRunRequest(BaseModel):
+class WorkflowCliRunRequest(BaseModel):
+    command: str
+    timeout_seconds: int = 30
+
+
+class CustomWorkflowCodeRunRequest(BaseModel):
     code: str
     args: dict[str, Any] = Field(default_factory=dict)
     timeout_seconds: int = 30

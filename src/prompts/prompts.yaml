@@ -24,14 +24,13 @@ tools:
     Output format:
     - Markdown text with JSON code fences for schema/examples/output shape.
 
-  run_workflow: >
-    Execute a prebuilt workflow by id with structured args.
+  run_workflow_cli: >
+    Execute a prebuilt workflow by CLI-style command.
 
     Prefer this path over generated scripts whenever a matching workflow exists.
 
     Parameters:
-    - workflow_id (required): workflow id
-    - args (required): JSON object of workflow arguments
+    - command (required): CLI form `<workflow_id> [--flag value]...`
     - timeout_seconds (optional): execution timeout (default 30, capped server-side)
 
     Output:
@@ -40,15 +39,14 @@ tools:
     - Search-style workflows render concise match lists with line numbers.
     - File-context workflow renders a code block with line numbers.
 
-  execute_ephemeral_script: >
-    Execute a generated Python script in an isolated subprocess after AST safety checks.
+  run_custom_workflow_code: >
+    Execute generated custom workflow code in an isolated subprocess after AST safety checks.
 
     Use only when no prebuilt workflow can satisfy the task.
 
     Required script constraints:
-    - must define `def parse_args(...)`
-    - must define `async def main()`
-    - must include `if __name__ == "__main__": ...`
+    - preferred shape: `def run(args)` or `async def run(args)`
+    - legacy shape with `parse_args/main/__main__` is still supported
     - imports are restricted; generated scripts should use `runtime.zoekt_tools`
 
     Parameters:
@@ -64,9 +62,9 @@ guides:
     Capability-first workflow:
     1. Call `search_capabilities` with the objective.
     2. Call `read_capability` on the best candidate id(s).
-    3. Prefer `run_workflow` whenever a prebuilt workflow matches.
-    4. Use `execute_ephemeral_script` only as fallback.
+    3. Prefer `run_workflow_cli` whenever a prebuilt workflow matches.
+    4. Use `run_custom_workflow_code` only as fallback.
 
     Execution marker convention:
-    - Scripts should print one final line in form `__RESULT_JSON__=<json>`.
+    - Runner accepts marker output `__RESULT_JSON__=<json>` and also falls back to parsing plain JSON stdout.
     - The runner parses that payload into `ExecutionResult.result_json`.
