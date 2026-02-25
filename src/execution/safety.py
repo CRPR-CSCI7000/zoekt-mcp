@@ -8,6 +8,10 @@ _ALLOWED_IMPORTS = {
     "runtime.zoekt_tools",
 }
 
+_ALLOWED_RUNTIME_FROM_IMPORTS = {
+    "zoekt_tools",
+}
+
 _BANNED_IMPORT_PREFIXES = {
     "builtins",
     "ctypes",
@@ -69,6 +73,11 @@ def validate_custom_workflow_code(code: str) -> list[str]:
 
         if isinstance(node, ast.ImportFrom):
             module_name = node.module or ""
+            if module_name == "runtime":
+                for alias in node.names:
+                    if alias.name not in _ALLOWED_RUNTIME_FROM_IMPORTS:
+                        rejections.append(f"disallowed_import: runtime.{alias.name}")
+                continue
             _check_import(module_name, rejections)
 
         if isinstance(node, ast.Call):

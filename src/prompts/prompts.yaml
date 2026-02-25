@@ -49,7 +49,8 @@ tools:
     Required script constraints:
     - preferred shape: `def run(args)` or `async def run(args)`
     - legacy shape with `parse_args/main/__main__` is still supported
-    - imports are restricted; generated scripts should use `runtime.zoekt_tools`
+    - imports are restricted; generated scripts should use
+      `from runtime import zoekt_tools` or `import runtime.zoekt_tools as zoekt_tools`
 
     Parameters:
     - code (required): Python source code

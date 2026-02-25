@@ -355,7 +355,7 @@ execution_patterns:
 
   - id: execution.run_custom_workflow_code
     summary: Fallback path for one-off tasks not covered by workflows.
-    when_to_use: Use only when no prebuilt workflow can satisfy the objective.
+    when_to_use: Use only when no prebuilt workflow can satisfy the objective, and only after calling read_capability for this id to confirm constraints.
     required_args:
       - code
     example: 'run_custom_workflow_code(code="...")'
@@ -378,14 +378,15 @@ execution_patterns:
         args:
           code: |
             import asyncio
-            import runtime.zoekt_tools as zoekt_tools
+            from runtime import zoekt_tools
 
             async def run(args):
                 query = str(args.get("query", "")).strip()
                 results = await asyncio.to_thread(zoekt_tools.search, query, 5, 1)
                 return {"results": results}
     constraints:
-      - Allowed imports are restricted (argparse/asyncio/json/sys/runtime.zoekt_tools).
+      - Allowed imports are restricted (argparse/asyncio/json/sys/runtime helpers via
+        `from runtime import zoekt_tools` or `import runtime.zoekt_tools as zoekt_tools`).
       - Banned imports and calls are rejected before execution.
       - This is process-level isolation, not container-grade sandboxing.
     expected_output_shape:

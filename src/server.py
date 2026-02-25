@@ -287,7 +287,7 @@ class ZoektMCPServer:
         return [
             "### Capability Types",
             "- `workflow`: prebuilt analysis flows invoked with `run_workflow_cli`.",
-            "- `runtime_tool`: Python helpers available in custom code as `runtime.zoekt_tools.*`.",
+            "- `runtime_tool`: Python helpers available in custom code via `from runtime import zoekt_tools`.",
             "- `execution_pattern`: guidance capabilities for execution interfaces (prefix `execution.*`).",
         ]
 

@@ -55,7 +55,8 @@ Generated scripts are AST-validated before execution:
   - `def parse_args(...)`
   - `def/async def main()`
   - `if __name__ == "__main__": ...`
-- Import allowlist centered on: `argparse`, `asyncio`, `json`, `sys`, and `runtime.zoekt_tools`
+- Import allowlist centered on: `argparse`, `asyncio`, `json`, `sys`, and runtime helpers via
+  `from runtime import zoekt_tools` or `import runtime.zoekt_tools as zoekt_tools`
 - Banned imports include modules such as `os`, `subprocess`, `socket`, `ctypes`, `multiprocessing`, `pathlib`
 - Banned calls include `eval`, `exec`, `compile`, `open`, `__import__`, `input`
 
